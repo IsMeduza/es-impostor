@@ -1,16 +1,14 @@
 /**
  * ES IMPOSTOR - Cloudflare Worker Backend
- * Salas en tiempo real + Generación de palabras con Gemini Flash
+ * Salas en tiempo real + Generaci�n de palabras con Gemini Flash
  */
 
 export interface Env {
   ROOMS: DurableObjectNamespace;
   gemini_key: string;
-  // Opcional: límite diario de Gemini configurable vía variable de entorno (string -> number)
   GEMINI_DAILY_LIMIT?: string;
 }
 
-// Tipo para info de sala pública
 interface PublicRoomInfo {
   code: string;
   playerCount: number;
@@ -18,21 +16,14 @@ interface PublicRoomInfo {
   topic: string;
   name?: string;
   createdAt: number;
-  phase?: 'lobby' | 'playing' | 'hints' | 'vote' | 'results';
+  phase?: 'lobby' | 'reveal' | 'hints' | 'vote' | 'results';
 }
 
-// Almacenamiento en memoria de salas públicas activas
 const publicRooms: Map<string, PublicRoomInfo> = new Map();
-
-// PIN de admin (cámbialo antes de desplegar)
 const ADMIN_PIN = 'poiu1234';
 
-// Métricas simples en memoria (se reinician al redeploy)
 let totalRoomsCreated = 0;
 let totalGeminiCalls = 0;
-
-// Ventana simple para limitar uso de Gemini y evitar sustos de coste
-// Valor por defecto razonable; se puede sobreescribir con env.GEMINI_DAILY_LIMIT
 let GEMINI_DAILY_LIMIT = 500;
 let geminiWindowStart = Date.now();
 let geminiWindowCount = 0;
@@ -45,7 +36,6 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
 
-    // CORS headers
     const corsHeaders = {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
@@ -57,28 +47,33 @@ export default {
     }
 
     try {
-      // Permitir sobreescribir el límite diario de Gemini desde el entorno
       if (env.GEMINI_DAILY_LIMIT) {
         const parsed = parseInt(env.GEMINI_DAILY_LIMIT, 10);
         if (!Number.isNaN(parsed) && parsed > 0 && parsed < 100000) {
           GEMINI_DAILY_LIMIT = parsed;
         }
       }
-      // Health check
+
       if (path === '/api/health') {
         return json({ ok: true, service: 'es-impostor-worker' }, corsHeaders);
       }
 
-      // Panel admin (stats básicas)
       if (path === '/api/admin' && request.method === 'GET') {
         const pin = url.searchParams.get('pin') || '';
         if (pin !== ADMIN_PIN) {
           return json({ error: 'Unauthorized' }, corsHeaders, 401);
         }
 
-        // No limpiamos aquí para no tocar el mapa; solo mostramos estado actual
-        const roomsArray = Array.from(publicRooms.values());
+        const now = Date.now();
+        for (const [code, room] of publicRooms) {
+          const isOld = now - room.createdAt > 15 * 60 * 1000;
+          const isEmpty = room.playerCount <= 0;
+          if (isOld && isEmpty) {
+            publicRooms.delete(code);
+          }
+        }
 
+        const roomsArray = Array.from(publicRooms.values());
         const usagePct = GEMINI_DAILY_LIMIT > 0
           ? Math.min(100, Math.round((geminiWindowCount / GEMINI_DAILY_LIMIT) * 100))
           : 0;
@@ -97,14 +92,12 @@ export default {
         }, corsHeaders);
       }
 
-      // Generar palabra con IA
       if (path === '/api/generate-word' && request.method === 'POST') {
         const body = await request.json() as { topic?: string; category?: string; needHint?: boolean };
         const result = await generateWordWithGemini(env.gemini_key, body.topic, body.category, body.needHint);
         return json({ word: result.word, hint: result.hint }, corsHeaders);
       }
 
-      // Crear sala
       if (path === '/api/rooms' && request.method === 'POST') {
         const body = await request.json() as { config: RoomConfig };
         const code = generateRoomCode();
@@ -122,12 +115,11 @@ export default {
           totalRoomsCreated++;
         }
 
-        // Si es pública, registrar en la lista
         if (body.config.isPublic && data.success) {
           publicRooms.set(code, {
             code,
             playerCount: 0,
-            maxPlayers: body.config.numPlayers || 4,
+            maxPlayers: body.config.numPlayers || 6,
             topic: body.config.topic || body.config.category || 'general',
             name: body.config.roomName || '',
             createdAt: Date.now()
@@ -137,21 +129,16 @@ export default {
         return json(data, corsHeaders);
       }
 
-      // Listar salas públicas
       if (path === '/api/rooms/public' && request.method === 'GET') {
-        // Limpiar solo salas realmente inactivas:
-        // - creadas hace más de 15 minutos
-        // - y sin jugadores (playerCount <= 0)
         const now = Date.now();
         for (const [code, room] of publicRooms) {
-          const isOld = now - room.createdAt > 15 * 60 * 1000; // >15 min
+          const isOld = now - room.createdAt > 15 * 60 * 1000;
           const isEmpty = room.playerCount <= 0;
           if (isOld && isEmpty) {
             publicRooms.delete(code);
           }
         }
 
-        // Actualizar estado real de cada sala para saber si sigue en lobby
         const updatedRooms: PublicRoomInfo[] = [];
         for (const [code, info] of publicRooms) {
           try {
@@ -160,7 +147,6 @@ export default {
             const stateResp = await room.fetch(new Request('https://room/state'));
             const state = await stateResp.json() as RoomState | { error: string };
             if ((state as any).error) {
-              // Si la sala ya no existe, eliminarla
               publicRooms.delete(code);
               continue;
             }
@@ -170,19 +156,17 @@ export default {
             publicRooms.set(code, info);
             updatedRooms.push(info);
           } catch {
-            // Si hay error al leer estado, dejamos la sala fuera de la lista pública
             publicRooms.delete(code);
           }
         }
 
         const rooms = updatedRooms
           .filter(r => r.playerCount < r.maxPlayers && r.phase === 'lobby')
-          .slice(0, 20); // Máximo 20 salas
+          .slice(0, 20);
 
         return json({ rooms }, corsHeaders);
       }
 
-      // Admin: cerrar sala pública manualmente
       if (path.startsWith('/api/admin/rooms/') && request.method === 'DELETE') {
         const pin = url.searchParams.get('pin') || '';
         if (pin !== ADMIN_PIN) {
@@ -197,7 +181,6 @@ export default {
         return json({ ok: true, code }, corsHeaders);
       }
 
-      // Unirse a sala
       if (path.startsWith('/api/rooms/') && path.endsWith('/join') && request.method === 'POST') {
         const code = path.split('/')[3].toUpperCase();
         const body = await request.json() as { player: PlayerJoin };
@@ -210,7 +193,6 @@ export default {
         }));
 
         const data = await response.json();
-        // Mantener contador de salas públicas (aproximado)
         try {
           const info = publicRooms.get(code);
           const count = (data as any)?.state?.players?.length;
@@ -218,13 +200,10 @@ export default {
             info.playerCount = count;
             publicRooms.set(code, info);
           }
-        } catch {
-          // noop
-        }
+        } catch { /* noop */ }
         return json(data, corsHeaders);
       }
 
-      // WebSocket para sala
       if (path.startsWith('/api/rooms/') && path.endsWith('/ws')) {
         const code = path.split('/')[3].toUpperCase();
         const roomId = env.ROOMS.idFromName(code);
@@ -232,12 +211,10 @@ export default {
         return room.fetch(request);
       }
 
-      // Estado de sala
       if (path.startsWith('/api/rooms/') && request.method === 'GET') {
         const code = path.split('/')[3].toUpperCase();
         const roomId = env.ROOMS.idFromName(code);
         const room = env.ROOMS.get(roomId);
-
         const response = await room.fetch(new Request('https://room/state'));
         const data = await response.json();
         return json(data, corsHeaders);
@@ -255,14 +232,16 @@ export default {
 // DURABLE OBJECT: ROOM
 // ============================================
 interface RoomConfig {
-  mode: 'list' | 'ai';
+  mode: 'list' | 'ai' | 'random';
   topic: string;
   category: string;
+  categories: string[];
   numImpostors: number;
-  numPlayers: number; // máximo de jugadores
-  isPublic: boolean; // sala pública o privada
-  impostorClueEnabled?: boolean; // Pistas para impostores
-  roomName?: string; // Nombre visible de la sala
+  numPlayers: number;
+  numRounds: number;
+  isPublic: boolean;
+  impostorClueEnabled?: boolean;
+  roomName?: string;
 }
 
 interface Player {
@@ -270,10 +249,13 @@ interface Player {
   name: string;
   icon: string;
   role?: 'civil' | 'impostor';
-  hint?: string; // Pista dada por el jugador
-  impostorClue?: string; // Pista recibida por el impostor
+  hint?: string;
+  impostorClue?: string;
   votedFor?: string;
   connected: boolean;
+  isReady: boolean;
+  hasSeenRole: boolean;
+  suspectedBy: string[];
 }
 
 interface PlayerJoin {
@@ -285,9 +267,10 @@ interface RoomState {
   code: string;
   config: RoomConfig;
   players: Player[];
-  phase: 'lobby' | 'playing' | 'hints' | 'vote' | 'results';
+  hostId: string | null;
+  phase: 'lobby' | 'reveal' | 'hints' | 'vote' | 'results';
   secretWord: string | null;
-  currentTurn: number;
+  currentRound: number;
   winner: 'civils' | 'impostor' | null;
   createdAt: number;
 }
@@ -298,8 +281,7 @@ export class RoomsDurableObject {
   sessions: Map<WebSocket, string> = new Map();
   roomState: RoomState | null = null;
 
-  // Conjunto fijo de iconos para online (evitar iconos repetidos dentro de una sala)
-  onlineIcons: string[] = ['🦊', '🐱', '🐶', '🐼', '🐵', '🐸', '🐯', '🐰', '🐻', '🐨', '🐷', '🐙'];
+  readonly availableIcons: string[] = ['🦊', '🐱', '🐶', '🐼', '🐵', '🐸', '🦁', '🐰', '🐻', '🐨', '🐷', '🐙'];
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
@@ -310,21 +292,20 @@ export class RoomsDurableObject {
     const url = new URL(request.url);
     const path = url.pathname;
 
-    // WebSocket upgrade
     if (request.headers.get('Upgrade') === 'websocket') {
       return this.handleWebSocket(request);
     }
 
-    // Crear sala
     if (path === '/create' && request.method === 'POST') {
       const body = await request.json() as { code: string; config: RoomConfig };
       this.roomState = {
         code: body.code,
         config: body.config,
         players: [],
+        hostId: null,
         phase: 'lobby',
         secretWord: null,
-        currentTurn: 0,
+        currentRound: 1,
         winner: null,
         createdAt: Date.now(),
       };
@@ -332,7 +313,6 @@ export class RoomsDurableObject {
       return json({ code: body.code, success: true });
     }
 
-    // Unirse a sala
     if (path === '/join' && request.method === 'POST') {
       const player = await request.json() as PlayerJoin;
       if (!this.roomState) {
@@ -343,11 +323,18 @@ export class RoomsDurableObject {
         return json({ error: 'Room not found' }, {}, 404);
       }
 
-      // Asegurar icono único dentro de la sala
+      if (this.roomState.phase !== 'lobby') {
+        return json({ error: 'Game already started' }, {}, 400);
+      }
+
+      if (this.roomState.players.length >= this.roomState.config.numPlayers) {
+        return json({ error: 'Room is full' }, {}, 400);
+      }
+
       const usedIcons = new Set(this.roomState.players.map(p => p.icon));
       let finalIcon = player.icon || '🦊';
       if (usedIcons.has(finalIcon)) {
-        const available = this.onlineIcons.find(icon => !usedIcons.has(icon));
+        const available = this.availableIcons.find(icon => !usedIcons.has(icon));
         if (available) {
           finalIcon = available;
         }
@@ -358,16 +345,23 @@ export class RoomsDurableObject {
         name: player.name,
         icon: finalIcon,
         connected: true,
+        isReady: false,
+        hasSeenRole: false,
+        suspectedBy: [],
       };
 
       this.roomState.players.push(newPlayer);
+
+      if (this.roomState.players.length === 1) {
+        this.roomState.hostId = newPlayer.id;
+      }
+
       await this.state.storage.put('room', this.roomState);
       this.broadcast({ type: 'player-joined', player: newPlayer, state: this.roomState });
 
       return json({ playerId: newPlayer.id, state: this.roomState });
     }
 
-    // Estado actual
     if (path === '/state') {
       if (!this.roomState) {
         this.roomState = await this.state.storage.get('room') as RoomState | null;
@@ -393,13 +387,36 @@ export class RoomsDurableObject {
       }
     });
 
-    server.addEventListener('close', () => {
+    server.addEventListener('close', async () => {
       const playerId = this.sessions.get(server);
       if (playerId && this.roomState) {
         const player = this.roomState.players.find(p => p.id === playerId);
         if (player) {
           player.connected = false;
-          this.broadcast({ type: 'player-disconnected', playerId });
+          
+          // Contar jugadores conectados restantes
+          const connectedPlayers = this.roomState.players.filter(p => p.connected);
+          
+          if (connectedPlayers.length === 0) {
+            // No queda nadie - marcar sala como cerrada
+            this.roomState.phase = 'lobby'; // Reset para limpieza
+            this.roomState.players = []; // Limpiar jugadores
+            this.roomState.hostId = null;
+            await this.state.storage.put('room', this.roomState);
+            // La sala se limpiará de publicRooms en el próximo GET /api/rooms/public
+          } else {
+            // Si el host se desconecta, transferir a otro jugador conectado
+            if (this.roomState.hostId === playerId) {
+              const newHost = connectedPlayers[0];
+              if (newHost) {
+                this.roomState.hostId = newHost.id;
+                this.broadcast({ type: 'host-changed', newHostId: newHost.id, state: this.roomState });
+              }
+            }
+            
+            await this.state.storage.put('room', this.roomState);
+            this.broadcast({ type: 'player-disconnected', playerId, state: this.roomState });
+          }
         }
       }
       this.sessions.delete(server);
@@ -415,68 +432,146 @@ export class RoomsDurableObject {
     if (!this.roomState) return;
 
     switch (data.type) {
-      case 'connect':
+      case 'connect': {
         this.sessions.set(ws, data.playerId);
         const player = this.roomState.players.find(p => p.id === data.playerId);
         if (player) {
           player.connected = true;
-          this.broadcast({ type: 'player-connected', playerId: data.playerId });
+          this.broadcast({ type: 'player-connected', playerId: data.playerId, state: this.roomState });
         }
         ws.send(JSON.stringify({ type: 'state', state: this.roomState }));
         break;
+      }
 
-      case 'start-game':
-        if (this.roomState.players.length >= 3) {
+      case 'toggle-ready': {
+        const player = this.roomState.players.find(p => p.id === data.playerId);
+        if (player && this.roomState.phase === 'lobby') {
+          player.isReady = !player.isReady;
+          await this.state.storage.put('room', this.roomState);
+          this.broadcast({ type: 'state', state: this.roomState });
+        }
+        break;
+      }
+
+      case 'change-icon': {
+        const player = this.roomState.players.find(p => p.id === data.playerId);
+        if (player && this.roomState.phase === 'lobby') {
+          const usedIcons = new Set(this.roomState.players.filter(p => p.id !== data.playerId).map(p => p.icon));
+          if (!usedIcons.has(data.icon)) {
+            player.icon = data.icon;
+            await this.state.storage.put('room', this.roomState);
+            this.broadcast({ type: 'state', state: this.roomState });
+          }
+        }
+        break;
+      }
+
+      case 'start-game': {
+        const isHost = this.roomState.hostId === data.playerId;
+        const allReady = this.roomState.players.every(p => p.isReady);
+        const enoughPlayers = this.roomState.players.length >= 3;
+
+        if (isHost && allReady && enoughPlayers && this.roomState.phase === 'lobby') {
           await this.startGame();
         }
         break;
+      }
 
-      case 'submit-hint':
-        this.roomState.players[this.roomState.currentTurn].hint = data.hint;
-        this.roomState.currentTurn++;
+      case 'role-seen': {
+        const player = this.roomState.players.find(p => p.id === data.playerId);
+        if (player && this.roomState.phase === 'reveal') {
+          player.hasSeenRole = true;
+          await this.state.storage.put('room', this.roomState);
+          this.broadcast({ type: 'state', state: this.roomState });
 
-        if (this.roomState.currentTurn >= this.roomState.players.length) {
-          this.roomState.phase = 'vote';
-          this.roomState.currentTurn = 0;
+          if (this.roomState.players.every(p => p.hasSeenRole)) {
+            this.roomState.phase = 'hints';
+            await this.state.storage.put('room', this.roomState);
+            this.broadcast({ type: 'state', state: this.roomState });
+          }
         }
-
-        await this.state.storage.put('room', this.roomState);
-        this.broadcast({ type: 'state', state: this.roomState });
         break;
+      }
 
-      case 'submit-vote':
-        this.roomState.players[this.roomState.currentTurn].votedFor = data.votedFor;
-        this.roomState.currentTurn++;
+      case 'submit-hint': {
+        const player = this.roomState.players.find(p => p.id === data.playerId);
+        if (player && this.roomState.phase === 'hints' && !player.hint) {
+          player.hint = data.hint;
+          await this.state.storage.put('room', this.roomState);
+          this.broadcast({ type: 'state', state: this.roomState });
 
-        if (this.roomState.currentTurn >= this.roomState.players.length) {
-          this.calculateResults();
+          if (this.roomState.players.every(p => p.hint)) {
+            this.roomState.phase = 'vote';
+            await this.state.storage.put('room', this.roomState);
+            this.broadcast({ type: 'state', state: this.roomState });
+          }
         }
-
-        await this.state.storage.put('room', this.roomState);
-        this.broadcast({ type: 'state', state: this.roomState });
         break;
+      }
 
-      case 'play-again':
+      case 'suspect-player': {
+        const suspect = this.roomState.players.find(p => p.id === data.suspectId);
+        if (suspect && data.playerId !== data.suspectId) {
+          if (suspect.suspectedBy.includes(data.playerId)) {
+            suspect.suspectedBy = suspect.suspectedBy.filter(id => id !== data.playerId);
+          } else {
+            suspect.suspectedBy.push(data.playerId);
+          }
+          await this.state.storage.put('room', this.roomState);
+          this.broadcast({ type: 'state', state: this.roomState });
+        }
+        break;
+      }
+
+      case 'submit-vote': {
+        const player = this.roomState.players.find(p => p.id === data.playerId);
+        if (player && this.roomState.phase === 'vote' && !player.votedFor) {
+          player.votedFor = data.votedFor;
+          await this.state.storage.put('room', this.roomState);
+          this.broadcast({ type: 'state', state: this.roomState });
+
+          if (this.roomState.players.every(p => p.votedFor)) {
+            this.calculateResults();
+            await this.state.storage.put('room', this.roomState);
+            this.broadcast({ type: 'state', state: this.roomState });
+          }
+        }
+        break;
+      }
+
+      case 'play-again': {
         this.roomState.phase = 'lobby';
         this.roomState.secretWord = null;
-        this.roomState.currentTurn = 0;
+        this.roomState.currentRound = 1;
         this.roomState.winner = null;
         this.roomState.players.forEach(p => {
           p.role = undefined;
           p.hint = undefined;
           p.impostorClue = undefined;
           p.votedFor = undefined;
+          p.isReady = false;
+          p.hasSeenRole = false;
+          p.suspectedBy = [];
         });
         await this.state.storage.put('room', this.roomState);
         this.broadcast({ type: 'state', state: this.roomState });
         break;
+      }
+
+      case 'kick-player': {
+        if (this.roomState.hostId === data.playerId && this.roomState.phase === 'lobby') {
+          this.roomState.players = this.roomState.players.filter(p => p.id !== data.kickId);
+          await this.state.storage.put('room', this.roomState);
+          this.broadcast({ type: 'player-kicked', kickedId: data.kickId, state: this.roomState });
+        }
+        break;
+      }
     }
   }
 
   async startGame() {
     if (!this.roomState) return;
 
-    // Asignar roles
     const indices = [...Array(this.roomState.players.length).keys()];
     indices.sort(() => Math.random() - 0.5);
     const impostorIndices = new Set(indices.slice(0, this.roomState.config.numImpostors));
@@ -484,54 +579,66 @@ export class RoomsDurableObject {
     this.roomState.players.forEach((p, i) => {
       p.role = impostorIndices.has(i) ? 'impostor' : 'civil';
       p.hint = undefined;
-      p.impostorClue = undefined; // Resetear pista anterior
+      p.impostorClue = undefined;
       p.votedFor = undefined;
+      p.hasSeenRole = false;
+      p.suspectedBy = [];
     });
 
-    // Generar palabra y pista (sí aplica)
     let secretWord = 'MISTERIO';
     let clue = '';
 
-    if (this.roomState.config.mode === 'ai') {
+    const config = this.roomState.config;
+
+    if (config.mode === 'ai' && config.topic) {
       const result = await generateWordWithGemini(
         this.env.gemini_key,
-        this.roomState.config.topic,
-        this.roomState.config.category,
-        this.roomState.config.impostorClueEnabled
+        config.topic,
+        undefined,
+        config.impostorClueEnabled
       );
       secretWord = result.word;
       clue = result.hint || '';
-    } else {
+    } else if (config.mode === 'random' || (config.mode === 'list' && config.categories?.length > 0)) {
       const lists: Record<string, string[]> = {
-        general: ['CASA', 'COCHE', 'LIBRO', 'MESA', 'RELOJ', 'VENTANA', 'ESPEJO'],
-        animals: ['GATO', 'PERRO', 'ELEFANTE', 'LEÓN', 'TIGRE', 'DELFÍN', 'ÁGUILA'],
-        food: ['PIZZA', 'PASTA', 'SUSHI', 'TACOS', 'PAELLA', 'HAMBURGUESA', 'HELADO'],
-        movies: ['TITANIC', 'AVATAR', 'MATRIX', 'INCEPTION', 'JOKER', 'FROZEN', 'COCO'],
-        custom: ['SOMBRA', 'MISTERIO', 'SECRETO', 'AVENTURA', 'MAGIA', 'TESORO'],
+        general: ['CASA', 'COCHE', 'LIBRO', 'MESA', 'RELOJ', 'VENTANA', 'ESPEJO', 'TEL�FONO', 'ORDENADOR', 'SILLA'],
+        animals: ['GATO', 'PERRO', 'ELEFANTE', 'LE�N', 'TIGRE', 'DELF�N', '�GUILA', 'SERPIENTE', 'CABALLO', 'CONEJO'],
+        food: ['PIZZA', 'PASTA', 'SUSHI', 'TACOS', 'PAELLA', 'HAMBURGUESA', 'HELADO', 'CHOCOLATE', 'ENSALADA', 'TORTILLA'],
+        movies: ['TITANIC', 'AVATAR', 'MATRIX', 'JOKER', 'FROZEN', 'COCO', 'GLADIATOR', 'BATMAN', 'SPIDERMAN', 'SHREK'],
+        sports: ['F�TBOL', 'TENIS', 'BALONCESTO', 'NATACI�N', 'CICLISMO', 'GOLF', 'BOXEO', 'ATLETISMO', 'SURF', 'ESQU�'],
+        places: ['PLAYA', 'MONTA�A', 'CIUDAD', 'DESIERTO', 'SELVA', 'ISLA', 'MUSEO', 'PARQUE', 'HOSPITAL', 'COLEGIO'],
+        professions: ['M�DICO', 'PROFESOR', 'BOMBERO', 'POLIC�A', 'COCINERO', 'PILOTO', 'ARQUITECTO', 'ACTOR', 'M�SICO', 'INGENIERO'],
       };
 
-      const category = this.roomState.config.category in lists ? this.roomState.config.category : 'general';
-      const wordList = lists[category];
+      const categoryHints: Record<string, string> = {
+        general: 'OBJETO',
+        animals: 'SER VIVO',
+        food: 'SE COME',
+        movies: 'CINE',
+        sports: 'ACTIVIDAD',
+        places: 'SITIO',
+        professions: 'TRABAJO',
+      };
+
+      let category = 'general';
+      if (config.mode === 'random') {
+        const allCategories = Object.keys(lists);
+        category = allCategories[Math.floor(Math.random() * allCategories.length)];
+      } else if (config.categories?.length > 0) {
+        category = config.categories[Math.floor(Math.random() * config.categories.length)];
+      }
+
+      const wordList = lists[category] || lists.general;
       secretWord = wordList[Math.floor(Math.random() * wordList.length)];
 
-      if (this.roomState.config.impostorClueEnabled) {
-        // Mapeo simple de pistas para el modo lista
-        const fallbacks: Record<string, string> = {
-          general: 'OBJETO',
-          animals: 'ANIMAL',
-          food: 'COMIDA',
-          movies: 'PELÍCULA',
-          custom: 'ALGO'
-        };
-        // Intentar dar una pista algo más específica si es posible, pero por ahora genérica
-        clue = fallbacks[category] || 'COSA';
+      if (config.impostorClueEnabled) {
+        clue = categoryHints[category] || 'ALGO';
       }
     }
 
     this.roomState.secretWord = secretWord;
 
-    // Asignar pista a los impostores
-    if (this.roomState.config.impostorClueEnabled && clue) {
+    if (config.impostorClueEnabled && clue) {
       this.roomState.players.forEach(p => {
         if (p.role === 'impostor') {
           p.impostorClue = clue;
@@ -539,8 +646,8 @@ export class RoomsDurableObject {
       });
     }
 
-    this.roomState.phase = 'hints';
-    this.roomState.currentTurn = 0;
+    this.roomState.phase = 'reveal';
+    this.roomState.currentRound = 1;
 
     await this.state.storage.put('room', this.roomState);
     this.broadcast({ type: 'game-started', state: this.roomState });
@@ -556,9 +663,11 @@ export class RoomsDurableObject {
 
     const maxVotes = Math.max(...Object.values(votes), 0);
     const mostVoted = Object.entries(votes).filter(([, v]) => v === maxVotes).map(([k]) => k);
-    const impostor = this.roomState.players.find(p => p.role === 'impostor');
 
-    this.roomState.winner = mostVoted.includes(impostor?.id || '') ? 'civils' : 'impostor';
+    const impostors = this.roomState.players.filter(p => p.role === 'impostor').map(p => p.id);
+    const impostorCaught = mostVoted.some(id => impostors.includes(id));
+
+    this.roomState.winner = impostorCaught ? 'civils' : 'impostor';
     this.roomState.phase = 'results';
   }
 
@@ -578,41 +687,32 @@ export class RoomsDurableObject {
 // GEMINI FLASH API
 // ============================================
 async function generateWordWithGemini(apiKey: string, topic?: string, category?: string, needHint?: boolean): Promise<{ word: string, hint?: string }> {
-  // Ventana diaria simple para limitar uso
   const now = Date.now();
   if (now - geminiWindowStart > 24 * 60 * 60 * 1000) {
     geminiWindowStart = now;
     geminiWindowCount = 0;
   }
 
-  // Si llegamos al límite diario, usamos fallback local sin llamar a la API
   if (geminiWindowCount >= GEMINI_DAILY_LIMIT) {
     const fallback = ['MISTERIO', 'AVENTURA', 'TESORO', 'MAGIA', 'SOMBRA', 'SECRETO'];
     return { word: fallback[Math.floor(Math.random() * fallback.length)], hint: needHint ? 'CONCEPTO' : undefined };
   }
 
-  // Contar todas las llamadas (tanto desde API como desde salas online)
   totalGeminiCalls++;
   geminiWindowCount++;
+
   if (!apiKey || apiKey.includes('XXXX')) {
-    // Fallback si no hay API key
     const fallback = ['MISTERIO', 'AVENTURA', 'TESORO', 'MAGIA', 'SOMBRA', 'SECRETO'];
     return { word: fallback[Math.floor(Math.random() * fallback.length)], hint: 'CONCEPTO' };
   }
 
-  /* 
-    Prompt optimizado:
-    Si needHint es true, pedimos JSON con { word: "...", hint: "..." }
-    Si no, pedimos solo texto (para mantener compatibilidad o simplicidad, pero mejor siempre JSON)
-  */
-
   const basePrompt = topic
     ? `Tema: "${topic}"`
-    : `Categoría: "${category || 'general'}"`;
+    : `Categor�a: "${category || 'general'}"`;
 
   const instruction = needHint
-    ? `Genera un JSON con dos campos: "word" (palabra en español, sustantivo común, mayúsculas) y "hint" (otra palabra también en mayúsculas, relacionada pero NO la misma, para dar como pista). Solo JSON.`
-    : `Genera solo una palabra en español (sustantivo común, mayúsculas) relacionada. Solo texto.`;
+    ? `Genera un JSON con dos campos: "word" (palabra en espa�ol, sustantivo com�n, may�sculas) y "hint" (otra palabra tambi�n en may�sculas, relacionada pero NO la misma, para dar como pista). Solo JSON.`
+    : `Genera solo una palabra en espa�ol (sustantivo com�n, may�sculas) relacionada. Solo texto.`;
 
   const prompt = `${basePrompt}. ${instruction}`;
 
@@ -644,11 +744,10 @@ async function generateWordWithGemini(apiKey: string, topic?: string, category?:
           hint: json.hint?.toUpperCase() || 'COSA'
         };
       } catch (e) {
-        // Fallback si falla el parseo
         return { word: 'MISTERIO', hint: 'ALGO' };
       }
     } else {
-      const word = text.trim().toUpperCase().replace(/[^A-ZÁÉÍÓÚÑÜ]/g, '');
+      const word = text.trim().toUpperCase().replace(/[^A-Z�������]/g, '');
       return { word: word || 'MISTERIO' };
     }
 

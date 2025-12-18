@@ -88,11 +88,15 @@ export function App() {
   const wsRef = useRef<WebSocket | null>(null);
   const [onlineGameState, setOnlineGameState] = useState<{
     secretWord: string | null;
-    currentTurn: number;
-    phase: 'lobby' | 'playing' | 'hints' | 'vote' | 'results';
+    currentRound: number;
+    phase: 'lobby' | 'reveal' | 'hints' | 'vote' | 'results';
     winner: 'civils' | 'impostor' | null;
+    hostId: string | null;
   } | null>(null);
   const [localSelectedVote, setLocalSelectedVote] = useState<string | null>(null);
+  const [roleRevealed2, setRoleRevealed2] = useState(false); // For online role reveal
+  const [hintInput, setHintInput] = useState('');
+  const [showIconPickerOnline, setShowIconPickerOnline] = useState(false);
 
   // Online rooms state
   interface PublicRoom {
@@ -101,8 +105,11 @@ export function App() {
     maxPlayers: number;
     topic: string;
     name?: string;
+    createdAt?: number;
   }
   const [publicRooms, setPublicRooms] = useState<PublicRoom[]>([]);
+  const [isLoadingRooms, setIsLoadingRooms] = useState(false);
+  const [roomsFilter, setRoomsFilter] = useState<'all' | 'available'>('available');
   const [playerName, setPlayerName] = useState('');
   const [joinCode, setJoinCode] = useState('');
   const [onlineTab, setOnlineTab] = useState<'join' | 'create'>('join');
@@ -134,6 +141,12 @@ export function App() {
   const [adminLoading, setAdminLoading] = useState(false);
   const [adminClosingRoom, setAdminClosingRoom] = useState<string | null>(null);
 
+  // Scroll automático hacia arriba cuando aparece un error
+  useEffect(() => {
+    if (onlineError || adminError) {
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+  }, [onlineError, adminError]);
 
   const t = useCallback((key: string, params?: Record<string, string>) =>
     translate(locale, key, params), [locale]);
@@ -831,6 +844,7 @@ export function App() {
   // ONLINE: FUNCIONES DE SALAS
   // ============================================
   const loadPublicRooms = async () => {
+    setIsLoadingRooms(true);
     try {
       const res = await fetch(`${CONFIG.API_URL}/api/rooms/public`);
       const data = await res.json();
@@ -838,6 +852,8 @@ export function App() {
     } catch (e) {
       console.error('Error loading rooms:', e);
       setPublicRooms([]);
+    } finally {
+      setIsLoadingRooms(false);
     }
   };
 
@@ -846,10 +862,10 @@ export function App() {
       setOnlineError('Introduce tu nombre');
       return;
     }
-  if (!roomName.trim()) {
-    setOnlineError(t('online.roomNameRequired') || 'Pon un nombre a la sala');
-    return;
-  }
+    if (!roomName.trim()) {
+      setOnlineError(t('online.roomNameRequired') || 'Pon un nombre a la sala');
+      return;
+    }
     if (config.numPlayers < 3) {
       setOnlineError(t('setup.minPlayers'));
       return;
@@ -962,15 +978,24 @@ export function App() {
       const data = JSON.parse(event.data);
       console.log('WS Message:', data);
 
-      if (data.type === 'state' || data.type === 'game-started' || data.type === 'player-joined' || data.type === 'player-connected' || data.type === 'player-disconnected') {
+      if (data.type === 'player-kicked' && data.kickedId === playerIdRef.current) {
+        // Fuimos expulsados
+        setOnlineError('Has sido expulsado de la sala');
+        setPhase('online-setup');
+        try { ws.close(); } catch { /* noop */ }
+        return;
+      }
+
+      if (data.type === 'state' || data.type === 'game-started' || data.type === 'player-joined' || data.type === 'player-connected' || data.type === 'player-disconnected' || data.type === 'player-kicked' || data.type === 'host-changed') {
         const roomState = data.state || data;
 
         // Actualizar estado del juego online
         setOnlineGameState({
           secretWord: roomState.secretWord || null,
-          currentTurn: roomState.currentTurn || 0,
+          currentRound: roomState.currentRound || 1,
           phase: roomState.phase || 'lobby',
-          winner: roomState.winner || null
+          winner: roomState.winner || null,
+          hostId: roomState.hostId || null
         });
 
         // Actualizar jugadores
@@ -979,17 +1004,23 @@ export function App() {
             id: p.id,
             name: p.name || 'Anonymous',
             icon: p.icon || '👤',
-            role: p.role || 'civil',
-            hasSeenRole: p.role ? true : false, // Si tiene rol, ya lo vio
+            role: p.role,
+            hasSeenRole: p.hasSeenRole || false,
             hint: p.hint,
-            votedFor: p.votedFor
+            votedFor: p.votedFor,
+            isReady: p.isReady || false,
+            suspectedBy: p.suspectedBy || [],
+            impostorClue: p.impostorClue,
+            connected: p.connected !== false
           })));
         }
 
         // Actualizar fase según el estado del servidor
         if (roomState.phase === 'lobby') {
           setPhase('lobby');
-        } else if (roomState.phase === 'hints' || roomState.phase === 'playing') {
+        } else if (roomState.phase === 'reveal') {
+          setPhase('online-reveal');
+        } else if (roomState.phase === 'hints') {
           setPhase('online-hints');
         } else if (roomState.phase === 'vote') {
           setPhase('online-vote');
@@ -1128,124 +1159,171 @@ export function App() {
                 {/* ========== ADMIN PANEL (/admin) ========== */}
                 {isAdminRoute && (
                   <div className="screen screen-scroll fade-in">
-                    <div className="setup-container">
-                      <div className="setup-header">
-                        <div className="setup-title-area">
-                          <h1 className="setup-title">{t('admin.title')}</h1>
-                        </div>
+                    <div className="admin-container">
+                      {/* Header */}
+                      <div className="admin-header">
+                        <div className="admin-header-icon">🛡️</div>
+                        <h1 className="admin-header-title">{t('admin.title')}</h1>
+                        <p className="admin-header-subtitle">{t('admin.subtitle')}</p>
                       </div>
 
-                      <div className="config-card-wide">
-                        <div className="config-card-glow name" />
-                        <div className="setup-title-area" style={{ marginBottom: '8px' }}>
-                          <span className="config-card-icon" style={{ fontSize: '24px' }}>🔑</span>
-                          <h3 style={{ margin: 0, fontSize: '18px' }}>{t('admin.pinLabel')}</h3>
-                        </div>
-                        <div className="online-join-row">
-                          <input
-                            type="password"
-                            className="online-input"
-                            value={adminPin}
-                            onChange={(e) => setAdminPin(e.target.value)}
-                            placeholder={t('admin.pinPlaceholder')}
-                            maxLength={12}
-                          />
-                          <button
-                            className="online-join-btn"
-                            onClick={loadAdminStats}
-                            disabled={adminLoading}
-                          >
-                            {adminLoading ? '...' : t('admin.view')}
-                          </button>
-                        </div>
-                      </div>
-
-                      {adminError && (
-                        <div className="online-error" style={{ marginTop: '12px' }}>
-                          <span className="error-icon">⚠️</span>
-                          <span>{adminError}</span>
+                      {/* Login Card */}
+                      {!adminStats && (
+                        <div className="admin-login-card">
+                          <div className="admin-login-icon">🔐</div>
+                          <div className="admin-login-form">
+                            <label className="admin-login-label">{t('admin.pinLabel')}</label>
+                            <div className="admin-login-row">
+                              <input
+                                type="password"
+                                className="admin-login-input"
+                                value={adminPin}
+                                onChange={(e) => setAdminPin(e.target.value)}
+                                onKeyDown={(e) => e.key === 'Enter' && loadAdminStats()}
+                                placeholder="••••••••"
+                                maxLength={12}
+                              />
+                              <button
+                                className="admin-login-btn"
+                                onClick={loadAdminStats}
+                                disabled={adminLoading}
+                              >
+                                {adminLoading ? (
+                                  <span className="admin-spinner">⟳</span>
+                                ) : (
+                                  <>🔓 {t('admin.view')}</>
+                                )}
+                              </button>
+                            </div>
+                            {adminError && (
+                              <div className="admin-error">
+                                <span>⚠️</span> {adminError}
+                              </div>
+                            )}
+                          </div>
                         </div>
                       )}
 
+                      {/* Dashboard */}
                       {adminStats && (
-                        <div className="config-card-wide" style={{ marginTop: '20px' }}>
-                          <div className="config-card-glow join" />
-                          <div className="setup-title-area" style={{ marginBottom: '8px' }}>
-                            <span className="config-card-icon" style={{ fontSize: '24px' }}>📊</span>
-                            <h3 style={{ margin: 0, fontSize: '18px' }}>{t('admin.statsTitle')}</h3>
-                          </div>
-                          <ul style={{ listStyle: 'none', padding: 0, margin: '8px 0', display: 'flex', flexDirection: 'column', gap: '6px', fontSize: '14px' }}>
-                            <li>{t('admin.totalRooms')}: <strong>{adminStats.totalRoomsCreated}</strong></li>
-                            <li>{t('admin.publicRooms')}: <strong>{adminStats.publicRooms}</strong></li>
-                            <li>
-                              {t('admin.geminiCalls')}:&nbsp;
-                              <strong>
+                        <div className="admin-dashboard">
+                          {/* Stats Grid */}
+                          <div className="admin-stats-grid">
+                            <div className="admin-stat-card">
+                              <div className="admin-stat-icon">🏠</div>
+                              <div className="admin-stat-value">{adminStats.totalRoomsCreated}</div>
+                              <div className="admin-stat-label">{t('admin.totalRooms')}</div>
+                            </div>
+                            <div className="admin-stat-card active">
+                              <div className="admin-stat-icon">🌐</div>
+                              <div className="admin-stat-value">{adminStats.publicRooms}</div>
+                              <div className="admin-stat-label">{t('admin.publicRooms')}</div>
+                            </div>
+                            <div className={`admin-stat-card ${adminStats.geminiNearLimit ? 'warning' : ''}`}>
+                              <div className="admin-stat-icon">✨</div>
+                              <div className="admin-stat-value">
                                 {adminStats.geminiWindowCount ?? adminStats.totalGeminiCalls}
-                                {adminStats.geminiDailyLimit
-                                  ? ` / ${adminStats.geminiDailyLimit} (${adminStats.geminiUsagePct ?? Math.round(((adminStats.geminiWindowCount ?? 0) / adminStats.geminiDailyLimit) * 100)}%)`
-                                  : ''}
-                              </strong>
-                            </li>
-                          </ul>
-                          <div style={{ marginTop: '8px', fontSize: '12px', opacity: 0.7 }}>
-                            {t('admin.lastUpdate')}: {new Date(adminStats.timestamp).toLocaleTimeString()}
+                                <span className="admin-stat-max">/{adminStats.geminiDailyLimit || '∞'}</span>
+                              </div>
+                              <div className="admin-stat-label">{t('admin.geminiCalls')}</div>
+                              {adminStats.geminiDailyLimit > 0 && (
+                                <div className="admin-stat-bar">
+                                  <div
+                                    className="admin-stat-bar-fill"
+                                    style={{ width: `${adminStats.geminiUsagePct || 0}%` }}
+                                  />
+                                </div>
+                              )}
+                            </div>
                           </div>
+
+                          {/* Warning */}
                           {adminStats.geminiNearLimit && (
-                            <div style={{ marginTop: '8px', fontSize: '12px', color: 'var(--color-warning)' }}>
-                              {t('admin.geminiNearLimit')}
+                            <div className="admin-warning">
+                              <span>⚠️</span> {t('admin.geminiNearLimit')}
                             </div>
                           )}
-                          {adminStats.publicRoomsDetail && adminStats.publicRoomsDetail.length > 0 && (
-                            <div style={{ marginTop: '16px' }}>
-                              <h4 style={{ margin: '0 0 8px', fontSize: '14px' }}>{t('admin.publicRoomsList')}</h4>
-                              <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', maxHeight: '220px', overflowY: 'auto' }}>
+
+                          {/* Rooms List */}
+                          <div className="admin-rooms-section">
+                            <div className="admin-rooms-header">
+                              <h2 className="admin-rooms-title">
+                                <span>📋</span> {t('admin.publicRoomsList')}
+                              </h2>
+                              <button
+                                className="admin-refresh-btn"
+                                onClick={loadAdminStats}
+                                disabled={adminLoading}
+                              >
+                                {adminLoading ? '⟳' : '🔄'} {t('admin.refresh')}
+                              </button>
+                            </div>
+
+                            {adminStats.publicRoomsDetail && adminStats.publicRoomsDetail.length > 0 ? (
+                              <div className="admin-rooms-list">
                                 {adminStats.publicRoomsDetail.map((room: any) => (
-                                  <div
-                                    key={room.code}
-                                    style={{
-                                      padding: '8px 10px',
-                                      borderRadius: '10px',
-                                      border: '1px solid var(--color-border)',
-                                      background: 'var(--color-bg-element)',
-                                      display: 'flex',
-                                      flexDirection: 'column',
-                                      gap: '4px',
-                                      fontSize: '12px'
-                                    }}
-                                  >
-                                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                                      <span style={{ fontFamily: 'var(--font-mono)', fontWeight: 700 }}>
-                                        {t('admin.code')}: {room.code}
-                                      </span>
-                                      <span>
-                                        {t('admin.players')}: {room.playerCount}/{room.maxPlayers}
-                                      </span>
+                                  <div key={room.code} className="admin-room-card">
+                                    <div className="admin-room-header">
+                                      <div className="admin-room-code">{room.code}</div>
+                                      <div className={`admin-room-phase ${room.phase || 'lobby'}`}>
+                                        {room.phase === 'lobby' && '⏳ Lobby'}
+                                        {room.phase === 'reveal' && '👁️ Reveal'}
+                                        {room.phase === 'hints' && '💬 Hints'}
+                                        {room.phase === 'vote' && '🗳️ Vote'}
+                                        {room.phase === 'results' && '🏆 Results'}
+                                        {!room.phase && '⏳ Lobby'}
+                                      </div>
                                     </div>
-                                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                                      <span>{t('admin.name')}: {room.name || '-'}</span>
-                                      <span>
-                                        {t('admin.topic')}: {room.topic}
-                                      </span>
+                                    <div className="admin-room-details">
+                                      <div className="admin-room-detail">
+                                        <span className="admin-room-detail-icon">👥</span>
+                                        <span>{room.playerCount}/{room.maxPlayers}</span>
+                                      </div>
+                                      <div className="admin-room-detail">
+                                        <span className="admin-room-detail-icon">🏷️</span>
+                                        <span>{room.name || '-'}</span>
+                                      </div>
+                                      <div className="admin-room-detail">
+                                        <span className="admin-room-detail-icon">🎯</span>
+                                        <span>{room.topic}</span>
+                                      </div>
+                                      <div className="admin-room-detail">
+                                        <span className="admin-room-detail-icon">⏱️</span>
+                                        <span>{Math.floor((Date.now() - room.createdAt) / 60000)} min</span>
+                                      </div>
                                     </div>
-                                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', opacity: 0.8 }}>
-                                      <span>
-                                        {t('admin.ageMinutes')}: {Math.floor((Date.now() - room.createdAt) / 60000)} min
-                                      </span>
-                                      <button
-                                        type="button"
-                                        className="btn btn-ghost"
-                                        style={{ fontSize: '11px', padding: '4px 8px' }}
-                                        onClick={() => adminCloseRoom(room.code)}
-                                        disabled={adminClosingRoom === room.code}
-                                      >
-                                        {adminClosingRoom === room.code ? t('admin.closing') : t('admin.closeRoom')}
-                                      </button>
-                                    </div>
+                                    <button
+                                      className="admin-room-close-btn"
+                                      onClick={() => adminCloseRoom(room.code)}
+                                      disabled={adminClosingRoom === room.code}
+                                    >
+                                      {adminClosingRoom === room.code ? (
+                                        <><span className="admin-spinner">⟳</span> {t('admin.closing')}</>
+                                      ) : (
+                                        <>🗑️ {t('admin.closeRoom')}</>
+                                      )}
+                                    </button>
                                   </div>
                                 ))}
                               </div>
-                            </div>
-                          )}
+                            ) : (
+                              <div className="admin-rooms-empty">
+                                <span className="admin-rooms-empty-icon">🔍</span>
+                                <span>{t('admin.noRooms')}</span>
+                              </div>
+                            )}
+                          </div>
+
+                          {/* Footer */}
+                          <div className="admin-footer">
+                            <span>{t('admin.lastUpdate')}: {new Date(adminStats.timestamp).toLocaleTimeString()}</span>
+                            <button
+                              className="admin-logout-btn"
+                              onClick={() => { setAdminStats(null); setAdminPin(''); }}
+                            >
+                              🚪 {t('admin.logout')}
+                            </button>
+                          </div>
                         </div>
                       )}
                     </div>
@@ -1254,527 +1332,783 @@ export function App() {
 
                 {!isAdminRoute && (
                   <>
-                {/* ========== HOME ========== */}
-                {phase === 'home' && (
-                  <div className="screen fade-in">
-                    <div className="home-hero">
-                      <div className="screen-icon">🎭</div>
-                      <h1 className="home-title">{t('home.title')}</h1>
-                      <p className="home-subtitle">{t('home.subtitle')}</p>
+                    {/* ========== HOME ========== */}
+                    {phase === 'home' && (
+                      <div className="screen fade-in">
+                        <div className="home-hero">
+                          <div className="screen-icon">🎭</div>
+                          <h1 className="home-title">{t('home.title')}</h1>
+                          <p className="home-subtitle">{t('home.subtitle')}</p>
 
-                      <div className="home-buttons">
-                        <button
-                          className="home-btn-3d home-btn-local"
-                          onClick={() => {
-                            setGameType('local');
-                            initPlayers(config.numPlayers);
-                            setPhase('setup');
-                          }}
-                        >
-                          <span className="btn-icon-3d">📱</span>
-                          {t('home.localGame')}
-                        </button>
-                        <button
-                          className="home-btn-3d home-btn-online"
-                          onClick={() => {
-                            setGameType('online');
-                            setPhase('online-setup');
-                            loadPublicRooms();
-                          }}
-                        >
-                          <span className="btn-icon-3d">🌐</span>
-                          {t('home.onlineGame')}
-                        </button>
-                        <button
-                          className="home-btn-3d home-btn-rules"
-                          onClick={() => setShowRules(true)}
-                        >
-                          <span className="btn-icon-3d">📖</span>
-                          {t('rules.button')}
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-                )}
-
-                {/* ========== ONLINE SETUP - SELECCIÓN DE SALAS ========== */}
-                {phase === 'online-setup' && (
-                  <div className="screen screen-scroll fade-in">
-                    <div className="setup-container">
-                      {/* Header */}
-                      <div className="setup-header">
-                        <button className="btn-back-glow" onClick={handleGoHome}>←</button>
-                        <div className="setup-title-area">
-                          <h1 className="setup-title">{t('online.title')}</h1>
+                          <div className="home-buttons">
+                            <button
+                              className="home-btn-3d home-btn-local"
+                              onClick={() => {
+                                setGameType('local');
+                                initPlayers(config.numPlayers);
+                                setPhase('setup');
+                              }}
+                            >
+                              <span className="btn-icon-3d">📱</span>
+                              {t('home.localGame')}
+                            </button>
+                            <button
+                              className="home-btn-3d home-btn-online"
+                              onClick={() => {
+                                setGameType('online');
+                                setPhase('online-setup');
+                                loadPublicRooms();
+                              }}
+                            >
+                              <span className="btn-icon-3d">🌐</span>
+                              {t('home.onlineGame')}
+                            </button>
+                            <button
+                              className="home-btn-3d home-btn-rules"
+                              onClick={() => setShowRules(true)}
+                            >
+                              <span className="btn-icon-3d">📖</span>
+                              {t('rules.button')}
+                            </button>
+                          </div>
                         </div>
                       </div>
+                    )}
 
-                      {onlineError && (
-                        <div className="online-error">
-                          <span className="error-icon">⚠️</span>
-                          <span>{onlineError}</span>
-                        </div>
-                      )}
-
-                      {/* Your Name */}
-                      <div className="config-card-wide">
-                        <div className="config-card-glow name" />
-                        <div className="setup-title-area" style={{ marginBottom: '8px' }}>
-                          <span className="config-card-icon" style={{ fontSize: '24px' }}>👤</span>
-                          <h3 style={{ margin: 0, fontSize: '18px' }}>{t('online.yourName')}</h3>
-                        </div>
-                        <input
-                          id="online-name-input"
-                          type="text"
-                          className="online-input"
-                          value={playerName}
-                          onChange={(e) => setPlayerName(e.target.value)}
-                          placeholder={t('online.namePlaceholder')}
-                          maxLength={20}
-                        />
-                      </div>
-
-                      {/* Tab Switcher */}
-                      <div className="online-tabs">
-                        <button
-                          className={`online-tab ${onlineTab === 'join' ? 'active' : ''}`}
-                          onClick={() => { setOnlineTab('join'); loadPublicRooms(); }}
-                        >
-                          <span className="tab-icon">🔑</span>
-                          {t('online.joinRoom')}
-                        </button>
-                        <button
-                          className={`online-tab ${onlineTab === 'create' ? 'active' : ''}`}
-                          onClick={() => setOnlineTab('create')}
-                        >
-                          <span className="tab-icon">✨</span>
-                          {t('online.createRoom')}
-                        </button>
-                      </div>
-
-                      {/* Tab Content: JOIN */}
-                      {onlineTab === 'join' && (
-                        <div className="tab-content fade-in">
-                          {/* Join by Code */}
-                          <div className="config-card-wide">
-                            <div className="config-card-glow join" />
-                            <div className="setup-title-area" style={{ marginBottom: '8px' }}>
-                              <span className="config-card-icon" style={{ fontSize: '24px' }}>🔑</span>
-                              <h3 style={{ margin: 0, fontSize: '18px' }}>{t('online.joinRoom')}</h3>
-                            </div>
-                            <div className="online-join-row">
-                              <input
-                                type="text"
-                                className="online-code-input"
-                                value={joinCode}
-                                onChange={(e) => setJoinCode(e.target.value.toUpperCase())}
-                                placeholder="ABCD"
-                                maxLength={6}
-                              />
-                              <button
-                                className="online-join-btn"
-                                onClick={() => joinCode && joinOnlineRoom(joinCode)}
-                                disabled={!joinCode || joinCode.length < 4 || !playerName.trim()}
-                              >
-                                {t('online.join')}
-                              </button>
+                    {/* ========== ONLINE SETUP - SELECCIÓN DE SALAS ========== */}
+                    {phase === 'online-setup' && (
+                      <div className="screen screen-scroll fade-in">
+                        <div className="setup-container">
+                          {/* Header */}
+                          <div className="setup-header">
+                            <button className="btn-back-glow" onClick={handleGoHome}>←</button>
+                            <div className="setup-title-area">
+                              <h1 className="setup-title">{t('online.title')}</h1>
                             </div>
                           </div>
 
-                          {/* Public Rooms List */}
-                            <div className="public-rooms-section" style={{ marginTop: '40px' }}>
-                            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', marginBottom: '20px', position: 'relative' }}>
-                              <h2 className="themes-title" style={{ margin: 0, textAlign: 'center' }}>
-                                <span className="themes-icon">🌍</span>
-                                {t('online.publicRooms')}
-                              </h2>
+                          {onlineError && (
+                            <div className="online-error">
+                              <span className="error-icon">⚠️</span>
+                              <span>{onlineError}</span>
+                            </div>
+                          )}
+
+                          {/* Your Name */}
+                          <div className="config-card-wide">
+                            <div className="config-card-glow name" />
+                            <div className="setup-title-area" style={{ marginBottom: '8px' }}>
+                              <span className="config-card-icon" style={{ fontSize: '24px' }}>👤</span>
+                              <h3 style={{ margin: 0, fontSize: '18px' }}>{t('online.yourName')}</h3>
+                            </div>
+                            <input
+                              id="online-name-input"
+                              type="text"
+                              className="online-input"
+                              value={playerName}
+                              onChange={(e) => setPlayerName(e.target.value)}
+                              placeholder={t('online.namePlaceholder')}
+                              maxLength={20}
+                            />
+                          </div>
+
+                          {/* Tab Switcher */}
+                          <div className="online-tabs">
+                            <button
+                              className={`online-tab ${onlineTab === 'join' ? 'active' : ''}`}
+                              onClick={() => { setOnlineTab('join'); loadPublicRooms(); }}
+                            >
+                              <span className="tab-icon">🔑</span>
+                              {t('online.joinRoom')}
+                            </button>
+                            <button
+                              className={`online-tab ${onlineTab === 'create' ? 'active' : ''}`}
+                              onClick={() => setOnlineTab('create')}
+                            >
+                              <span className="tab-icon">✨</span>
+                              {t('online.createRoom')}
+                            </button>
+                          </div>
+
+                          {/* Tab Content: JOIN */}
+                          {onlineTab === 'join' && (
+                            <div className="tab-content fade-in">
+                              {/* Join by Code */}
+                              <div className="config-card-wide">
+                                <div className="config-card-glow join" />
+                                <div className="setup-title-area" style={{ marginBottom: '8px' }}>
+                                  <span className="config-card-icon" style={{ fontSize: '24px' }}>🔑</span>
+                                  <h3 style={{ margin: 0, fontSize: '18px' }}>{t('online.joinRoom')}</h3>
+                                </div>
+                                <div className="online-join-row">
+                                  <input
+                                    type="text"
+                                    className="online-code-input"
+                                    value={joinCode}
+                                    onChange={(e) => setJoinCode(e.target.value.toUpperCase())}
+                                    placeholder="ABCD"
+                                    maxLength={6}
+                                  />
+                                  <button
+                                    className="online-join-btn"
+                                    onClick={() => joinCode && joinOnlineRoom(joinCode)}
+                                    disabled={!joinCode || joinCode.length < 4 || !playerName.trim()}
+                                  >
+                                    {t('online.join')}
+                                  </button>
+                                </div>
+                              </div>
+
+                              {/* Public Rooms List */}
+                              <div className="public-rooms-section">
+                                {/* Header con título y controles */}
+                                <div className="public-rooms-header">
+                                  <h2 className="public-rooms-title">
+                                    <span>🌍</span>
+                                    {t('online.publicRooms')}
+                                  </h2>
+                                  <div className="public-rooms-controls">
+                                    <button
+                                      className="public-rooms-refresh"
+                                      onClick={loadPublicRooms}
+                                      disabled={isLoadingRooms}
+                                      title={t('admin.refresh')}
+                                    >
+                                      {isLoadingRooms ? <span className="spinner">⟳</span> : '🔄'}
+                                    </button>
+                                  </div>
+                                </div>
+
+                                {/* Filtros */}
+                                <div className="public-rooms-filters">
+                                  <button
+                                    className={`filter-btn ${roomsFilter === 'available' ? 'active' : ''}`}
+                                    onClick={() => setRoomsFilter('available')}
+                                  >
+                                    {t('online.filter.available')}
+                                  </button>
+                                  <button
+                                    className={`filter-btn ${roomsFilter === 'all' ? 'active' : ''}`}
+                                    onClick={() => setRoomsFilter('all')}
+                                  >
+                                    {t('online.filter.all')}
+                                  </button>
+                                </div>
+
+                                {/* Loading State */}
+                                {isLoadingRooms && publicRooms.length === 0 && (
+                                  <div className="public-rooms-loading">
+                                    <span className="spinner large">⟳</span>
+                                    <span>{t('online.loadingRooms')}</span>
+                                  </div>
+                                )}
+
+                                {/* Rooms Grid */}
+                                <div className="public-rooms-grid">
+                                  {(() => {
+                                    const filteredRooms = roomsFilter === 'available'
+                                      ? publicRooms.filter(r => r.playerCount < r.maxPlayers)
+                                      : publicRooms;
+
+                                    if (filteredRooms.length > 0) {
+                                      return filteredRooms.map(room => {
+                                        const spotsLeft = room.maxPlayers - room.playerCount;
+                                        const isFull = spotsLeft === 0;
+                                        const ageMinutes = room.createdAt
+                                          ? Math.floor((Date.now() - room.createdAt) / 60000)
+                                          : null;
+
+                                        return (
+                                          <button
+                                            key={room.code}
+                                            className={`public-room-card ${isFull ? 'full' : ''}`}
+                                            onClick={() => {
+                                              if (isFull) return;
+                                              if (!playerName.trim()) {
+                                                setOnlineError(t('online.yourName'));
+                                                return;
+                                              }
+                                              joinOnlineRoom(room.code);
+                                            }}
+                                            disabled={isFull}
+                                          >
+                                            {/* Status Badge */}
+                                            <div className={`room-status-badge ${isFull ? 'full' : spotsLeft <= 2 ? 'almost-full' : 'open'}`}>
+                                              {isFull ? t('online.room.full') : `${spotsLeft} ${t('online.room.spots')}`}
+                                            </div>
+
+                                            {/* Room Code */}
+                                            <div className="room-code-large">{room.code}</div>
+
+                                            {/* Room Name */}
+                                            <div className="room-name-display">
+                                              {room.name || t('online.unnamedRoom')}
+                                            </div>
+
+                                            {/* Room Stats */}
+                                            <div className="room-stats">
+                                              <div className="room-stat">
+                                                <span className="room-stat-icon">👥</span>
+                                                <span className="room-stat-value">{room.playerCount}/{room.maxPlayers}</span>
+                                              </div>
+                                              <div className="room-stat">
+                                                <span className="room-stat-icon">🎯</span>
+                                                <span className="room-stat-value">{room.topic || t('theme.random')}</span>
+                                              </div>
+                                              {ageMinutes !== null && (
+                                                <div className="room-stat">
+                                                  <span className="room-stat-icon">⏱️</span>
+                                                  <span className="room-stat-value">{ageMinutes} min</span>
+                                                </div>
+                                              )}
+                                            </div>
+
+                                            {/* Join Hint */}
+                                            {!isFull && (
+                                              <div className="room-join-cta">
+                                                {t('online.join')} →
+                                              </div>
+                                            )}
+                                          </button>
+                                        );
+                                      });
+                                    } else if (!isLoadingRooms) {
+                                      return (
+                                        <div className="public-rooms-empty">
+                                          <span className="empty-icon">🔍</span>
+                                          <span className="empty-text">{t('online.noRooms')}</span>
+                                          <span className="empty-hint">{t('online.createOne')}</span>
+                                        </div>
+                                      );
+                                    }
+                                    return null;
+                                  })()}
+                                </div>
+
+                                {/* Auto-refresh indicator */}
+                                <div className="public-rooms-footer">
+                                  <span className="auto-refresh-hint">
+                                    ⟳ {t('online.autoRefresh')}
+                                  </span>
+                                </div>
+                              </div>
+                            </div>
+                          )}
+
+                          {/* Tab Content: CREATE */}
+                          {onlineTab === 'create' && (
+                            <div className="tab-content fade-in">
+                              {/* Room name */}
+                              <div className="config-card-wide" style={{ marginBottom: '16px' }}>
+                                <div className="config-card-glow name" />
+                                <div className="setup-title-area" style={{ marginBottom: '8px' }}>
+                                  <span className="config-card-icon" style={{ fontSize: '24px' }}>🏷️</span>
+                                  <h3 style={{ margin: 0, fontSize: '18px' }}>{t('online.roomName')}</h3>
+                                </div>
+                                <input
+                                  id="online-room-name-input"
+                                  type="text"
+                                  className="online-input"
+                                  value={roomName}
+                                  onChange={(e) => setRoomName(e.target.value)}
+                                  placeholder={t('online.roomNamePlaceholder')}
+                                  maxLength={24}
+                                />
+                              </div>
+
+                              <div className="config-row-online">
+                                {/* Players */}
+                                <div className="config-card-premium">
+                                  <div className="config-card-glow players" />
+                                  <span className="config-card-icon">👥</span>
+                                  <span className="config-card-label">{t('setup.numPlayers')}</span>
+                                  <div className="number-selector-premium">
+                                    <button className="num-btn minus" onClick={() => setConfig(c => ({ ...c, numPlayers: Math.max(3, c.numPlayers - 1), numImpostors: Math.min(c.numImpostors, Math.max(3, c.numPlayers - 1) - 1) }))} disabled={config.numPlayers <= 3}>−</button>
+                                    <span className="num-value">{config.numPlayers}</span>
+                                    <button className="num-btn plus" onClick={() => setConfig(c => ({ ...c, numPlayers: Math.min(12, c.numPlayers + 1) }))} disabled={config.numPlayers >= 12}>+</button>
+                                  </div>
+                                </div>
+
+                                {/* Impostores */}
+                                <div className="config-card-premium">
+                                  <div className="config-card-glow impostors" />
+                                  <span className="config-card-icon">🎭</span>
+                                  <span className="config-card-label">{t('setup.numImpostors')}</span>
+                                  <div className="number-selector-premium">
+                                    <button className="num-btn minus" onClick={() => setConfig(c => ({ ...c, numImpostors: Math.max(1, c.numImpostors - 1) }))} disabled={config.numImpostors <= 1}>−</button>
+                                    <span className="num-value">{config.numImpostors}</span>
+                                    <button className="num-btn plus" onClick={() => setConfig(c => ({ ...c, numImpostors: Math.min(config.numPlayers - 1, config.numImpostors + 1) }))} disabled={config.numImpostors >= config.numPlayers - 1}>+</button>
+                                  </div>
+                                </div>
+
+                                {/* Pista Toggle (Horizontal Card) */}
+                                <div className="config-card-premium">
+                                  <div className="config-card-glow clue" />
+                                  <span className="config-card-icon">💡</span>
+                                  <span className="config-card-label">{t('setup.clue')}</span>
+                                  <button
+                                    className={`toggle-premium ${config.impostorClueEnabled ? 'active' : ''}`}
+                                    onClick={() => setConfig(c => ({ ...c, impostorClueEnabled: !c.impostorClueEnabled }))}
+                                  />
+                                </div>
+
+                                {/* Public Toggle (Horizontal Card) */}
+                                <div className="config-card-premium">
+                                  <div className="config-card-glow create" />
+                                  <span className="config-card-icon">🌍</span>
+                                  <span className="config-card-label">{t('online.makePublic')}</span>
+                                  <button
+                                    className={`toggle-premium ${isPublicRoom ? 'active' : ''}`}
+                                    onClick={() => setIsPublicRoom(!isPublicRoom)}
+                                  />
+                                </div>
+                              </div>
+
+                              {/* Themes Section */}
+                              {renderThemesSection()}
+
+                              {/* Create Button */}
                               <button
-                                type="button"
-                                className="rooms-refresh-btn"
-                                onClick={loadPublicRooms}
-                                title={t('online.refresh') || 'Actualizar'}
+                                className="setup-next-btn"
+                                onClick={() => {
+                                  if (!playerName.trim()) {
+                                    setOnlineError(t('online.yourName'));
+                                    const nameInput = document.getElementById('online-name-input');
+                                    if (nameInput) {
+                                      nameInput.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                                      (nameInput as HTMLInputElement).focus();
+                                    }
+                                    return;
+                                  }
+                                  if (!roomName.trim()) {
+                                    setOnlineError(t('online.roomNameRequired'));
+                                    const roomInput = document.getElementById('online-room-name-input');
+                                    if (roomInput) {
+                                      roomInput.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                                      (roomInput as HTMLInputElement).focus();
+                                    }
+                                    return;
+                                  }
+                                  createOnlineRoom(isPublicRoom);
+                                }}
+                                disabled={isCreatingRoom}
                               >
-                                ↻
+                                {isCreatingRoom ? (
+                                  <><span className="spinner">⏳</span> {t('online.creating')}</>
+                                ) : (
+                                  <><span>{t('online.createRoom')}</span> <span className="btn-arrow">→</span></>
+                                )}
                               </button>
                             </div>
+                          )}
+                        </div>
+                      </div>
+                    )}
 
-                            <div className="rooms-grid">
-                              {publicRooms.length > 0 ? (
-                                publicRooms.map(room => (
+                    {/* ========== SETUP ========== */}
+                    {phase === 'setup' && gameType === 'local' && (
+                      <div className="screen screen-scroll fade-in">
+                        <div className="setup-container">
+                          {/* Header */}
+                          <div className="setup-header">
+                            <button className="btn-back-glow" onClick={handleGoHome}>←</button>
+                            <div className="setup-title-area">
+                              <h1 className="setup-title">{t('setup.title')}</h1>
+                            </div>
+                          </div>
+
+                          <div style={{ width: '100%' }}>
+                            {/* Config Cards Row */}
+                            <div className="config-grid-local">
+                              {/* Jugadores */}
+                              <div className="config-card-premium">
+                                <div className="config-card-glow players" />
+                                <span className="config-card-icon">👥</span>
+                                <span className="config-card-label">{t('setup.numPlayers')}</span>
+                                <div className="number-selector-premium">
+                                  <button className="num-btn minus" onClick={() => setConfig(c => ({ ...c, numPlayers: Math.max(3, c.numPlayers - 1), numImpostors: Math.min(c.numImpostors, Math.max(3, c.numPlayers - 1) - 1) }))} disabled={config.numPlayers <= 3}>−</button>
+                                  <span className="num-value">{config.numPlayers}</span>
+                                  <button className="num-btn plus" onClick={() => setConfig(c => ({ ...c, numPlayers: Math.min(12, c.numPlayers + 1) }))} disabled={config.numPlayers >= 12}>+</button>
+                                </div>
+                              </div>
+
+                              {/* Impostores */}
+                              <div className="config-card-premium">
+                                <div className="config-card-glow impostors" />
+                                <span className="config-card-icon">🎭</span>
+                                <span className="config-card-label">{t('setup.numImpostors')}</span>
+                                <div className="number-selector-premium">
+                                  <button className="num-btn minus" onClick={() => setConfig(c => ({ ...c, numImpostors: Math.max(1, c.numImpostors - 1) }))} disabled={config.numImpostors <= 1}>−</button>
+                                  <span className="num-value">{config.numImpostors}</span>
+                                  <button className="num-btn plus" onClick={() => setConfig(c => ({ ...c, numImpostors: Math.min(config.numPlayers - 1, config.numImpostors + 1) }))} disabled={config.numImpostors >= config.numPlayers - 1}>+</button>
+                                </div>
+                              </div>
+
+                              {/* Pista */}
+                              <div className="config-card-premium clue-card">
+                                <div className="config-card-glow clue" />
+                                <span className="config-card-icon">💡</span>
+                                <span className="config-card-label">{t('setup.clue')}</span>
+                                <button
+                                  className={`toggle-premium ${config.impostorClueEnabled ? 'active' : ''}`}
+                                  onClick={() => setConfig(c => ({ ...c, impostorClueEnabled: !c.impostorClueEnabled }))}
+                                />
+                              </div>
+                            </div>
+
+                            {/* Themes Section */}
+                            {renderThemesSection()}
+
+                            {/* Bottom Action */}
+                            <button className="setup-next-btn" onClick={() => {
+                              if (players.length !== config.numPlayers) {
+                                initPlayers(config.numPlayers);
+                              }
+                              setPhase('setup-players');
+                            }}>
+                              <span>{t('setup.next')}</span>
+                              <span className="btn-arrow">→</span>
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* ========== SETUP PLAYERS (NOMBRES) ========== */}
+                    {phase === 'setup-players' && (
+                      <div className="screen screen-scroll fade-in">
+                        <div className="setup-container">
+                          {/* Header */}
+                          <div className="setup-header">
+                            <button className="btn-back-glow" onClick={() => setPhase('setup')}>←</button>
+                            <div className="setup-title-area">
+                              <h1 className="setup-title">{t('setup.players')}</h1>
+                            </div>
+                          </div>
+
+                          {/* Lista de jugadores */}
+                          <div className="players-grid-premium">
+                            {players.map((p, i) => (
+                              <div key={p.id} className="player-card-premium">
+                                <button
+                                  className="player-icon-premium"
+                                  onClick={() => {
+                                    const icons = [...PLAYER_ICONS] as unknown as string[];
+                                    const usedByOthers = new Set(
+                                      players.filter((_, idx) => idx !== i).map(pl => pl.icon)
+                                    );
+                                    const currentIdx = Math.max(0, icons.indexOf(p.icon));
+
+                                    let nextIcon = p.icon;
+                                    for (let step = 1; step <= icons.length; step++) {
+                                      const candidate = icons[(currentIdx + step) % icons.length];
+                                      if (!usedByOthers.has(candidate as PlayerIcon)) {
+                                        nextIcon = candidate as PlayerIcon;
+                                        break;
+                                      }
+                                    }
+
+                                    updatePlayerIcon(i, nextIcon);
+                                  }}
+                                >
+                                  {p.icon}
+                                </button>
+                                <input
+                                  className="player-name-premium"
+                                  value={p.name}
+                                  onChange={(e) => updatePlayerName(i, e.target.value)}
+                                  placeholder={`${t('setup.player')} ${i + 1}`}
+                                  maxLength={12}
+                                />
+                              </div>
+                            ))}
+                          </div>
+
+                          {/* Bottom Action */}
+                          <button
+                            className="setup-next-btn start-btn"
+                            onClick={handleStartGame}
+                            disabled={players.length < 3 || players.some(p => !p.name.trim()) || isLoadingWord}
+                          >
+                            <span>{isLoadingWord ? '...' : (players.length < 3 ? t('setup.minPlayers') : t('setup.start'))}</span>
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* ========== LOBBY (ONLINE) - NUEVA UI ========== */}
+                    {phase === 'lobby' && onlineGameState && (
+                      <div className="screen screen-scroll fade-in">
+                        <div className="setup-container">
+                          {/* Header */}
+                          <div className="setup-header">
+                            <button className="btn-back-glow" onClick={handleGoHome}>←</button>
+                            <div className="setup-title-area">
+                              <h1 className="setup-title">{t('online.lobby.title')}</h1>
+                            </div>
+                          </div>
+
+                          {/* Room Code */}
+                          <div className="room-code-card" onClick={() => navigator.clipboard.writeText(roomCode)}>
+                            <span className="room-code-label">{t('lobby.roomCode')}</span>
+                            <span className="room-code-value">{roomCode}</span>
+                            <span className="room-code-copy">📋</span>
+                          </div>
+
+                          {/* Players List */}
+                          <div className="lobby-players-list">
+                            {players.map((p) => {
+                              const isMe = p.id === playerId;
+                              const isHost = p.id === onlineGameState.hostId;
+                              const myPlayer = players.find(pl => pl.id === playerId);
+                              const canKick = myPlayer?.id === onlineGameState.hostId && !isMe;
+
+                              return (
+                                <div key={p.id} className={`lobby-player-card ${isMe ? 'is-me' : ''} ${p.isReady ? 'is-ready' : ''} ${!p.connected ? 'disconnected' : ''}`}>
+                                  <div className="lobby-player-icon-container">
+                                    <span className="lobby-player-icon">{p.icon}</span>
+                                    {isMe && (
+                                      <button
+                                        className="lobby-change-icon-btn"
+                                        onClick={() => setShowIconPickerOnline(!showIconPickerOnline)}
+                                        title={t('online.lobby.changeIcon')}
+                                      >
+                                        ✏️
+                                      </button>
+                                    )}
+                                  </div>
+                                  <div className="lobby-player-info">
+                                    <span className="lobby-player-name">
+                                      {p.name}
+                                      {isMe && <span className="lobby-you-tag">{t('online.lobby.you')}</span>}
+                                      {isHost && <span className="lobby-host-tag">👑 {t('online.lobby.host')}</span>}
+                                    </span>
+                                    <span className={`lobby-player-status ${p.isReady ? 'ready' : 'not-ready'}`}>
+                                      {p.connected === false
+                                        ? t('online.lobby.disconnected')
+                                        : p.isReady
+                                          ? t('online.lobby.ready')
+                                          : t('online.lobby.notReady')}
+                                    </span>
+                                  </div>
+                                  {canKick && (
+                                    <button
+                                      className="lobby-kick-btn"
+                                      onClick={() => {
+                                        if (wsRef.current?.readyState === WebSocket.OPEN) {
+                                          wsRef.current.send(JSON.stringify({ type: 'kick-player', playerId, kickId: p.id }));
+                                        }
+                                      }}
+                                      title={t('online.lobby.kick')}
+                                    >
+                                      ❌
+                                    </button>
+                                  )}
+                                </div>
+                              );
+                            })}
+                          </div>
+
+                          {/* Icon Picker Modal */}
+                          {showIconPickerOnline && (
+                            <div className="icon-picker-modal" onClick={() => setShowIconPickerOnline(false)}>
+                              <div className="icon-picker-content" onClick={e => e.stopPropagation()}>
+                                <h3>{t('online.lobby.changeIcon')}</h3>
+                                <div className="icon-picker-grid">
+                                  {PLAYER_ICONS.map(icon => {
+                                    const isUsed = players.some(p => p.icon === icon && p.id !== playerId);
+                                    return (
+                                      <button
+                                        key={icon}
+                                        className={`icon-picker-option ${isUsed ? 'used' : ''}`}
+                                        disabled={isUsed}
+                                        onClick={() => {
+                                          if (!isUsed && wsRef.current?.readyState === WebSocket.OPEN) {
+                                            wsRef.current.send(JSON.stringify({ type: 'change-icon', playerId, icon }));
+                                            setShowIconPickerOnline(false);
+                                          }
+                                        }}
+                                      >
+                                        {icon}
+                                      </button>
+                                    );
+                                  })}
+                                </div>
+                              </div>
+                            </div>
+                          )}
+
+                          {/* Ready Status */}
+                          <div className="lobby-status-bar">
+                            {players.every(p => p.isReady) && players.length >= 3
+                              ? <span className="status-all-ready">✅ {t('online.lobby.allReady')}</span>
+                              : <span className="status-waiting">⏳ {t('online.lobby.waitingAll')}</span>
+                            }
+                          </div>
+
+                          {/* Actions */}
+                          <div className="lobby-actions">
+                            <button
+                              className="btn-ready"
+                              onClick={() => {
+                                if (wsRef.current?.readyState === WebSocket.OPEN) {
+                                  wsRef.current.send(JSON.stringify({ type: 'toggle-ready', playerId }));
+                                }
+                              }}
+                            >
+                              {players.find(p => p.id === playerId)?.isReady
+                                ? `❌ ${t('online.lobby.notReady')}`
+                                : `✅ ${t('online.lobby.ready')}`}
+                            </button>
+
+                            {onlineGameState.hostId === playerId && (
+                              <button
+                                className="setup-next-btn start-btn"
+                                disabled={!players.every(p => p.isReady) || players.length < 3}
+                                onClick={() => {
+                                  if (wsRef.current?.readyState === WebSocket.OPEN) {
+                                    wsRef.current.send(JSON.stringify({ type: 'start-game', playerId }));
+                                  }
+                                }}
+                              >
+                                {players.length < 3
+                                  ? t('online.lobby.minPlayers')
+                                  : t('online.lobby.startGame')} →
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* ========== ONLINE REVEAL (Ver rol) ========== */}
+                    {phase === 'online-reveal' && onlineGameState && (
+                      <div className="screen fade-in">
+                        {(() => {
+                          const myPlayer = players.find(p => p.id === playerId);
+                          if (!myPlayer) return null;
+
+                          const allSeen = players.every(p => p.hasSeenRole);
+
+                          return (
+                            <div className="online-reveal-container">
+                              {!roleRevealed2 ? (
+                                <div
+                                  className="reveal-tap-card"
+                                  onClick={() => setRoleRevealed2(true)}
+                                >
+                                  <div className="reveal-tap-icon">🎴</div>
+                                  <h2>{t('online.reveal.title')}</h2>
+                                  <p>{t('online.reveal.tapToSee')}</p>
+                                </div>
+                              ) : (
+                                <div className={`reveal-role-card ${myPlayer.role === 'impostor' ? 'impostor' : 'civil'}`}>
+                                  <div className="reveal-role-header">
+                                    <span className="reveal-your-icon">{myPlayer.icon}</span>
+                                    <h2>{t('online.reveal.youAre')}</h2>
+                                  </div>
+                                  <div className="reveal-role-name">
+                                    {myPlayer.role === 'impostor'
+                                      ? `🎭 ${t('online.reveal.impostor')}`
+                                      : `✅ ${t('online.reveal.civil')}`}
+                                  </div>
+
+                                  {myPlayer.role === 'civil' && onlineGameState.secretWord && (
+                                    <div className="reveal-word-section">
+                                      <span className="reveal-word-label">{t('online.reveal.secretWord')}</span>
+                                      <span className="reveal-word-value">{onlineGameState.secretWord}</span>
+                                    </div>
+                                  )}
+
+                                  {myPlayer.role === 'impostor' && (
+                                    <div className="reveal-impostor-info">
+                                      <span className="reveal-no-word">{t('online.reveal.noWord')}</span>
+                                      {myPlayer.impostorClue && (
+                                        <div className="reveal-clue">
+                                          <span className="reveal-clue-label">{t('online.reveal.clue')}</span>
+                                          <span className="reveal-clue-value">{myPlayer.impostorClue}</span>
+                                        </div>
+                                      )}
+                                    </div>
+                                  )}
+
                                   <button
-                                    key={room.code}
-                                    className="room-card-premium"
-                                    onClick={() => !playerName.trim() ? setOnlineError(t('online.yourName')) : joinOnlineRoom(room.code)}
+                                    className="btn btn-primary btn-large"
+                                    onClick={() => {
+                                      if (wsRef.current?.readyState === WebSocket.OPEN) {
+                                        wsRef.current.send(JSON.stringify({ type: 'role-seen', playerId }));
+                                      }
+                                    }}
+                                    disabled={myPlayer.hasSeenRole}
                                   >
-                                    <div className="room-info">
-                                      <span className="room-code">{room.code}</span>
-                                      <div className="room-meta">
-                                        <span className="room-name">{room.name || t('online.unnamedRoom')}</span>
-                                        <span className="room-players">
-                                          <span className="room-icon">👥</span>
-                                          {room.playerCount}/{room.maxPlayers}
-                                        </span>
+                                    {myPlayer.hasSeenRole ? t('online.reveal.waiting') : t('online.reveal.understood')}
+                                  </button>
+
+                                  {myPlayer.hasSeenRole && !allSeen && (
+                                    <div className="reveal-waiting-others">
+                                      <div className="waiting-spinner"></div>
+                                      <span>{t('online.reveal.waiting')}</span>
+                                      <div className="reveal-seen-count">
+                                        {players.filter(p => p.hasSeenRole).length} / {players.length}
                                       </div>
                                     </div>
-                                    <div className="room-topic-area">
-                                      <span className="room-topic-label">{t('theme.title')}:</span>
-                                      <span className="room-topic">{room.topic || t('theme.random')}</span>
-                                    </div>
-                                    <div className="room-join-hint">{t('online.join')}</div>
-                                  </button>
-                                ))
-                              ) : (
-                                <div className="no-rooms">
-                                  <p>{t('online.noRooms')}</p>
-                                  <p className="text-sm opacity-60">{t('online.createOne')}</p>
+                                  )}
                                 </div>
                               )}
                             </div>
-                          </div>
-                        </div>
-                      )}
-
-                      {/* Tab Content: CREATE */}
-                      {onlineTab === 'create' && (
-                        <div className="tab-content fade-in">
-                          {/* Room name */}
-                          <div className="config-card-wide" style={{ marginBottom: '16px' }}>
-                            <div className="config-card-glow name" />
-                            <div className="setup-title-area" style={{ marginBottom: '8px' }}>
-                              <span className="config-card-icon" style={{ fontSize: '24px' }}>🏷️</span>
-                              <h3 style={{ margin: 0, fontSize: '18px' }}>{t('online.roomName')}</h3>
-                            </div>
-                            <input
-                              type="text"
-                              className="online-input"
-                              value={roomName}
-                              onChange={(e) => setRoomName(e.target.value)}
-                              placeholder={t('online.roomNamePlaceholder')}
-                              maxLength={24}
-                            />
-                          </div>
-
-                          <div className="config-row-online">
-                            {/* Players */}
-                            <div className="config-card-premium">
-                              <div className="config-card-glow players" />
-                              <span className="config-card-icon">👥</span>
-                              <span className="config-card-label">{t('setup.numPlayers')}</span>
-                              <div className="number-selector-premium">
-                                <button className="num-btn minus" onClick={() => setConfig(c => ({ ...c, numPlayers: Math.max(3, c.numPlayers - 1), numImpostors: Math.min(c.numImpostors, Math.max(3, c.numPlayers - 1) - 1) }))} disabled={config.numPlayers <= 3}>−</button>
-                                <span className="num-value">{config.numPlayers}</span>
-                                <button className="num-btn plus" onClick={() => setConfig(c => ({ ...c, numPlayers: Math.min(12, c.numPlayers + 1) }))} disabled={config.numPlayers >= 12}>+</button>
-                              </div>
-                            </div>
-
-                            {/* Impostores */}
-                            <div className="config-card-premium">
-                              <div className="config-card-glow impostors" />
-                              <span className="config-card-icon">🎭</span>
-                              <span className="config-card-label">{t('setup.numImpostors')}</span>
-                              <div className="number-selector-premium">
-                                <button className="num-btn minus" onClick={() => setConfig(c => ({ ...c, numImpostors: Math.max(1, c.numImpostors - 1) }))} disabled={config.numImpostors <= 1}>−</button>
-                                <span className="num-value">{config.numImpostors}</span>
-                                <button className="num-btn plus" onClick={() => setConfig(c => ({ ...c, numImpostors: Math.min(config.numPlayers - 1, config.numImpostors + 1) }))} disabled={config.numImpostors >= config.numPlayers - 1}>+</button>
-                              </div>
-                            </div>
-
-                            {/* Pista Toggle (Horizontal Card) */}
-                            <div className="config-card-premium">
-                              <div className="config-card-glow clue" />
-                              <span className="config-card-icon">💡</span>
-                              <span className="config-card-label">{t('setup.clue')}</span>
-                              <button
-                                className={`toggle-premium ${config.impostorClueEnabled ? 'active' : ''}`}
-                                onClick={() => setConfig(c => ({ ...c, impostorClueEnabled: !c.impostorClueEnabled }))}
-                              />
-                            </div>
-
-                            {/* Public Toggle (Horizontal Card) */}
-                            <div className="config-card-premium">
-                              <div className="config-card-glow create" />
-                              <span className="config-card-icon">🌍</span>
-                              <span className="config-card-label">{t('online.makePublic')}</span>
-                              <button
-                                className={`toggle-premium ${isPublicRoom ? 'active' : ''}`}
-                                onClick={() => setIsPublicRoom(!isPublicRoom)}
-                              />
-                            </div>
-                          </div>
-
-                          {/* Themes Section */}
-                          {renderThemesSection()}
-
-                          {/* Create Button */}
-                          <button
-                            className="setup-next-btn"
-                            onClick={() => {
-                              if (!playerName.trim()) {
-                                setOnlineError(t('online.yourName'));
-                                const nameInput = document.getElementById('online-name-input');
-                                if (nameInput) {
-                                  nameInput.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                                  (nameInput as HTMLInputElement).focus();
-                                }
-                                return;
-                              }
-                              if (!roomName.trim()) {
-                                setOnlineError(t('online.roomNameRequired'));
-                                return;
-                              }
-                              createOnlineRoom(isPublicRoom);
-                            }}
-                            disabled={isCreatingRoom}
-                          >
-                            {isCreatingRoom ? (
-                              <><span className="spinner">⏳</span> {t('online.creating')}</>
-                            ) : (
-                              <><span>{t('online.createRoom')}</span> <span className="btn-arrow">→</span></>
-                            )}
-                          </button>
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                )}
-
-                {/* ========== SETUP ========== */}
-                {phase === 'setup' && gameType === 'local' && (
-                  <div className="screen screen-scroll fade-in">
-                    <div className="setup-container">
-                      {/* Header */}
-                      <div className="setup-header">
-                        <button className="btn-back-glow" onClick={handleGoHome}>←</button>
-                        <div className="setup-title-area">
-                          <h1 className="setup-title">{t('setup.title')}</h1>
-                        </div>
+                          );
+                        })()}
                       </div>
-
-                      <div style={{ width: '100%' }}>
-                        {/* Config Cards Row */}
-                        <div className="config-grid-local">
-                          {/* Jugadores */}
-                          <div className="config-card-premium">
-                            <div className="config-card-glow players" />
-                            <span className="config-card-icon">👥</span>
-                            <span className="config-card-label">{t('setup.numPlayers')}</span>
-                            <div className="number-selector-premium">
-                              <button className="num-btn minus" onClick={() => setConfig(c => ({ ...c, numPlayers: Math.max(3, c.numPlayers - 1), numImpostors: Math.min(c.numImpostors, Math.max(3, c.numPlayers - 1) - 1) }))} disabled={config.numPlayers <= 3}>−</button>
-                              <span className="num-value">{config.numPlayers}</span>
-                              <button className="num-btn plus" onClick={() => setConfig(c => ({ ...c, numPlayers: Math.min(12, c.numPlayers + 1) }))} disabled={config.numPlayers >= 12}>+</button>
-                            </div>
-                          </div>
-
-                          {/* Impostores */}
-                          <div className="config-card-premium">
-                            <div className="config-card-glow impostors" />
-                            <span className="config-card-icon">🎭</span>
-                            <span className="config-card-label">{t('setup.numImpostors')}</span>
-                            <div className="number-selector-premium">
-                              <button className="num-btn minus" onClick={() => setConfig(c => ({ ...c, numImpostors: Math.max(1, c.numImpostors - 1) }))} disabled={config.numImpostors <= 1}>−</button>
-                              <span className="num-value">{config.numImpostors}</span>
-                              <button className="num-btn plus" onClick={() => setConfig(c => ({ ...c, numImpostors: Math.min(config.numPlayers - 1, config.numImpostors + 1) }))} disabled={config.numImpostors >= config.numPlayers - 1}>+</button>
-                            </div>
-                          </div>
-
-                          {/* Pista */}
-                          <div className="config-card-premium clue-card">
-                            <div className="config-card-glow clue" />
-                            <span className="config-card-icon">💡</span>
-                            <span className="config-card-label">{t('setup.clue')}</span>
-                            <button
-                              className={`toggle-premium ${config.impostorClueEnabled ? 'active' : ''}`}
-                              onClick={() => setConfig(c => ({ ...c, impostorClueEnabled: !c.impostorClueEnabled }))}
-                            />
-                          </div>
-                        </div>
-
-                        {/* Themes Section */}
-                        {renderThemesSection()}
-
-                        {/* Bottom Action */}
-                        <button className="setup-next-btn" onClick={() => {
-                          if (players.length !== config.numPlayers) {
-                            initPlayers(config.numPlayers);
-                          }
-                          setPhase('setup-players');
-                        }}>
-                          <span>{t('setup.next')}</span>
-                          <span className="btn-arrow">→</span>
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-                )}
-
-                {/* ========== SETUP PLAYERS (NOMBRES) ========== */}
-                {phase === 'setup-players' && (
-                  <div className="screen screen-scroll fade-in">
-                    <div className="setup-container">
-                      {/* Header */}
-                      <div className="setup-header">
-                        <button className="btn-back-glow" onClick={() => setPhase('setup')}>←</button>
-                        <div className="setup-title-area">
-                          <h1 className="setup-title">{t('setup.players')}</h1>
-                        </div>
-                      </div>
-
-                      {/* Lista de jugadores */}
-                      <div className="players-grid-premium">
-                        {players.map((p, i) => (
-                          <div key={p.id} className="player-card-premium">
-                            <button
-                              className="player-icon-premium"
-                              onClick={() => {
-                                const icons = [...PLAYER_ICONS] as unknown as string[];
-                                const usedByOthers = new Set(
-                                  players.filter((_, idx) => idx !== i).map(pl => pl.icon)
-                                );
-                                const currentIdx = Math.max(0, icons.indexOf(p.icon));
-
-                                let nextIcon = p.icon;
-                                for (let step = 1; step <= icons.length; step++) {
-                                  const candidate = icons[(currentIdx + step) % icons.length];
-                                  if (!usedByOthers.has(candidate as PlayerIcon)) {
-                                    nextIcon = candidate as PlayerIcon;
-                                    break;
-                                  }
-                                }
-
-                                updatePlayerIcon(i, nextIcon);
-                              }}
-                            >
-                              {p.icon}
-                            </button>
-                            <input
-                              className="player-name-premium"
-                              value={p.name}
-                              onChange={(e) => updatePlayerName(i, e.target.value)}
-                              placeholder={`${t('setup.player')} ${i + 1}`}
-                              maxLength={12}
-                            />
-                          </div>
-                        ))}
-                      </div>
-
-                      {/* Bottom Action */}
-                      <button
-                        className="setup-next-btn start-btn"
-                        onClick={handleStartGame}
-                        disabled={players.length < 3 || players.some(p => !p.name.trim()) || isLoadingWord}
-                      >
-                        <span>{isLoadingWord ? '...' : (players.length < 3 ? t('setup.minPlayers') : t('setup.start'))}</span>
-                      </button>
-                    </div>
-                  </div>
-                )}
-
-                {/* ========== LOBBY (ONLINE) ========== */}
-                {phase === 'lobby' && (
-                  <div className="screen screen-scroll fade-in">
-                    <div className="lobby-header">
-                      <p className="text-soft text-sm uppercase tracking-wider">{t('lobby.roomCode')}</p>
-                      <div className="room-code-display" onClick={() => navigator.clipboard.writeText(roomCode)}>
-                        {roomCode}
-                        <span className="copy-icon">📋</span>
-                      </div>
-                    </div>
-
-                    <h2 className="screen-title text-xl mt-4">{t('lobby.waitingPlayers')}</h2>
-
-                    <div className="players-grid mt-4">
-                      {players.map((p) => (
-                        <div key={p.id} className="player-card">
-                          <div className="player-card-icon">{p.icon}</div>
-                          <div className="player-card-name font-bold">{p.name}</div>
-                        </div>
-                      ))}
-                      {/* Placeholders */}
-                      {[...Array(Math.max(0, config.numPlayers - players.length))].map((_, i) => (
-                        <div key={`empty-${i}`} className="player-card opacity-30 border-dashed">
-                          <div className="player-card-icon">👤</div>
-                          <div className="player-card-name">...</div>
-                        </div>
-                      ))}
-                    </div>
-
-                    <div className="flex gap-3 mt-8 w-full" style={{ justifyContent: 'center', maxWidth: 420, margin: '32px auto 0' }}>
-                      <button className="btn btn-ghost" onClick={handleGoHome}>{t('setup.back')}</button>
-                      <button
-                        className="btn btn-primary flex-1"
-                        disabled={players.length < 3 || !wsConnected}
-                        onClick={() => {
-                          if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-                            wsRef.current.send(JSON.stringify({ type: 'start-game' }));
-                          }
-                        }}
-                      >
-                        {t('setup.start')} →
-                      </button>
-                    </div>
-                  </div>
-                )}
-
-                {/* ========== TURN REVEAL CON FLIP CARD ========== */}
-                {phase === 'turn-reveal' && localGame && currentPlayer && (
-                  <div className="screen fade-in">
-                    <h1 className="screen-title">{t('turn.passDevice', { player: currentPlayer.name })}</h1>
-
-                    <FlipCard
-                      key={currentPlayer.id}
-                      icon={currentPlayer.icon}
-                      name={currentPlayer.name}
-                      role={currentPlayer.role as 'civil' | 'impostor'}
-                      secretWord={localGame.secretWord}
-                      clue={localGame.impostorClue}
-                      clueEnabled={config.impostorClueEnabled}
-                      onFlipped={() => setRoleRevealed(true)}
-                      t={t}
-                    />
-
-                    {roleRevealed && (
-                      <button className="btn btn-primary btn-large" onClick={handleNextTurn}>
-                        {countPlayersWhoSawRole() + 1 < players.length
-                          ? t('turn.next')
-                          : '¡A discutir!'} →
-                      </button>
                     )}
-                  </div>
-                )}
 
-                {/* ========== DISCUSSION - Sin votación manual ========== */}
-                {phase === 'discussion' && localGame && (
-                  <div className="screen fade-in">
-                    <div className="screen-icon">💬</div>
-                    <h1 className="screen-title">{t('discussion.title')}</h1>
-                    <p className="screen-subtitle">{t('discussion.subtitle')}</p>
-                    <p className="screen-subtitle" style={{ marginTop: '8px', opacity: 0.7 }}>
-                      {t('discussion.hint')}
-                    </p>
+                    {/* ========== TURN REVEAL CON FLIP CARD ========== */}
+                    {phase === 'turn-reveal' && localGame && currentPlayer && (
+                      <div className="screen fade-in" key={`reveal-${localGame.currentTurnIndex}`}>
+                        <h1 className="screen-title">{t('turn.passDevice', { player: currentPlayer.name })}</h1>
 
-                    <button
-                      className="btn btn-primary btn-large"
-                      onClick={() => setPhase('results')}
-                      style={{ marginTop: '24px' }}
-                    >
-                      {t('discussion.reveal')}
-                    </button>
-                  </div>
-                )}
+                        <FlipCard
+                          key={currentPlayer.id}
+                          icon={currentPlayer.icon}
+                          name={currentPlayer.name}
+                          role={currentPlayer.role as 'civil' | 'impostor'}
+                          secretWord={localGame.secretWord}
+                          clue={localGame.impostorClue}
+                          clueEnabled={config.impostorClueEnabled}
+                          onFlipped={() => setRoleRevealed(true)}
+                          t={t}
+                        />
 
-                {/* ========== VOTE (para online) ========== */}
-                {phase === 'vote' && localGame && currentPlayer && (
-                  <div className="screen fade-in">
-                    {!voteRevealed ? (
-                      <>
-                        <div className="screen-icon bounce">{currentPlayer.icon}</div>
-                        <h1 className="screen-title">{t('vote.passDevice', { player: currentPlayer.name })}</h1>
-                        <button className="btn btn-primary btn-large" onClick={() => setVoteRevealed(true)}>
-                          👆 {t('vote.tapToVote')}
+                        <button className="btn btn-primary btn-large" onClick={handleNextTurn} style={{ marginTop: '24px' }}>
+                          {countPlayersWhoSawRole() + 1 < players.length
+                            ? t('turn.next')
+                            : '¡A discutir!'} →
                         </button>
-                      </>
-                    ) : (
-                      <>
+                      </div>
+                    )}
+
+                    {/* ========== DISCUSSION - Sin votación manual ========== */}
+                    {phase === 'discussion' && localGame && (
+                      <div className="screen fade-in">
+                        <div className="screen-icon">💬</div>
+                        <h1 className="screen-title">{t('discussion.title')}</h1>
+                        <p className="screen-subtitle">{t('discussion.subtitle')}</p>
+                        <p className="screen-subtitle" style={{ marginTop: '8px', opacity: 0.7 }}>
+                          {t('discussion.hint')}
+                        </p>
+
+                        <button
+                          className="btn btn-primary btn-large"
+                          onClick={() => setPhase('results')}
+                          style={{ marginTop: '24px' }}
+                        >
+                          {t('discussion.reveal')}
+                        </button>
+                      </div>
+                    )}
+
+                    {/* ========== VOTE (para online) ========== */}
+                    {phase === 'vote' && localGame && currentPlayer && (
+                      <div className="screen fade-in" key={`vote-${localGame.currentTurnIndex}`}>
                         <h1 className="screen-title">{t('vote.title')}</h1>
                         <p className="screen-subtitle">{t('vote.selectImpostor')}</p>
 
@@ -1794,397 +2128,375 @@ export function App() {
                         <button className="btn btn-primary btn-large mt-4" onClick={handleConfirmVote} disabled={!selectedVote}>
                           {t('vote.confirm')} →
                         </button>
-                      </>
+                      </div>
                     )}
-                  </div>
-                )}
 
-                {/* ========== ONLINE HINTS (Pistas) ========== */}
-                {phase === 'online-hints' && onlineGameState && (
-                  <div className="screen fade-in">
-                    {(() => {
-                      const currentPlayerData = players.find(p => p.id === playerId);
-                      const isMyTurn = onlineGameState.currentTurn < players.length && players[onlineGameState.currentTurn]?.id === playerId;
-                      const currentTurnPlayer = players[onlineGameState.currentTurn];
-
-                      return (
-                        <>
-                          <h1 className="screen-title">
-                            {isMyTurn ? t('online.turn.yours') : t('online.turn.others', { icon: currentTurnPlayer?.icon, name: currentTurnPlayer?.name })}
-                          </h1>
-                          <p className="screen-subtitle">
-                            {isMyTurn
-                              ? t('online.hint.instruction')
-                              : t('online.hint.waiting', { player: currentTurnPlayer?.name })
-                            }
-                          </p>
-
-                          {currentPlayerData && (
-                            <div style={{
-                              padding: '20px',
-                              background: 'var(--color-bg-card)',
-                              borderRadius: '16px',
-                              border: '2px solid var(--color-border)',
-                              marginTop: '24px',
-                              maxWidth: '500px',
-                              width: '100%'
-                            }}>
-                              <div style={{ marginBottom: '16px' }}>
-                                <div style={{ fontSize: '14px', fontWeight: '600', marginBottom: '8px', color: 'var(--color-text)' }}>
-                                  Tu rol: {currentPlayerData.role === 'impostor' ? t('online.role.impostor') : t('online.role.civil')}
-                                </div>
-                                {currentPlayerData.role === 'civil' && onlineGameState.secretWord && (
-                                  <div style={{ fontSize: '18px', fontWeight: '700', color: 'var(--color-secondary)', fontFamily: 'var(--font-mono)' }}>
-                                    {t('online.secretWord', { word: onlineGameState.secretWord })}
-                                  </div>
-                                )}
-                                {currentPlayerData.role === 'impostor' && (
-                                  <>
-                                    <div style={{ fontSize: '14px', color: 'var(--color-warning)', marginBottom: currentPlayerData.impostorClue ? '8px' : '0' }}>
-                                      {t('online.impostorWarning')}
-                                    </div>
-                                    {currentPlayerData.impostorClue && (
-                                      <div style={{ fontSize: '18px', fontWeight: '700', color: 'var(--color-primary)', fontFamily: 'var(--font-mono)' }}>
-                                        {t('results.theClue')}: {currentPlayerData.impostorClue}
-                                      </div>
-                                    )}
-                                  </>
-                                )}
-                              </div>
-
-                              {isMyTurn && !currentPlayerData.hint && (
-                                <div style={{ display: 'flex', gap: '8px' }}>
-                                  <input
-                                    type="text"
-                                    className="input"
-                                    placeholder={t('online.placeholder')}
-                                    maxLength={50}
-                                    onKeyDown={(e) => {
-                                      if (e.key === 'Enter' && e.currentTarget.value.trim() && wsRef.current) {
-                                        wsRef.current.send(JSON.stringify({
-                                          type: 'submit-hint',
-                                          hint: e.currentTarget.value.trim()
-                                        }));
-                                        e.currentTarget.value = '';
-                                      }
-                                    }}
-                                    style={{ flex: 1 }}
-                                  />
-                                  <button
-                                    className="btn btn-primary"
-                                    onClick={(e) => {
-                                      const input = e.currentTarget.previousElementSibling as HTMLInputElement;
-                                      if (input.value.trim() && wsRef.current) {
-                                        wsRef.current.send(JSON.stringify({
-                                          type: 'submit-hint',
-                                          hint: input.value.trim()
-                                        }));
-                                        input.value = '';
-                                      }
-                                    }}
-                                  >
-                                    {t('online.send')}
-                                  </button>
-                                </div>
-                              )}
-
-                              {currentPlayerData.hint && (
-                                <div style={{
-                                  padding: '12px',
-                                  background: 'var(--color-bg-element)',
-                                  borderRadius: '8px',
-                                  fontSize: '16px',
-                                  fontWeight: '600'
-                                }}>
-                                  {t('online.yourHint', { hint: currentPlayerData.hint })}
-                                </div>
-                              )}
-                            </div>
-                          )}
-
-                          <div style={{ marginTop: '24px', width: '100%', maxWidth: '500px' }}>
-                            <div style={{ fontSize: '14px', fontWeight: '600', marginBottom: '12px', color: 'var(--color-text-soft)' }}>
-                              {t('online.hintsReceived')}
-                            </div>
-                            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                              {players.map((p, idx) => (
-                                <div
-                                  key={p.id}
-                                  style={{
-                                    padding: '12px',
-                                    background: idx < onlineGameState.currentTurn ? 'var(--color-bg-card)' : 'var(--color-bg-element)',
-                                    border: `2px solid ${idx < onlineGameState.currentTurn ? 'var(--color-secondary)' : 'var(--color-border)'}`,
-                                    borderRadius: '8px',
-                                    opacity: idx < onlineGameState.currentTurn ? 1 : 0.5,
-                                    display: 'flex',
-                                    alignItems: 'center',
-                                    gap: '12px'
-                                  }}
-                                >
-                                  <span style={{ fontSize: '24px' }}>{p.icon}</span>
-                                  <div style={{ flex: 1 }}>
-                                    <div style={{ fontSize: '14px', fontWeight: '600' }}>{p.name}</div>
-                                    {p.hint ? (
-                                      <div style={{ fontSize: '13px', color: 'var(--color-text-soft)', fontStyle: 'italic' }}>
-                                        "{p.hint}"
-                                      </div>
-                                    ) : (
-                                      <div style={{ fontSize: '12px', color: 'var(--color-text-soft)' }}>
-                                        {idx === onlineGameState.currentTurn ? t('online.typing') : t('online.pending')}
-                                      </div>
-                                    )}
-                                  </div>
-                                </div>
-                              ))}
+                    {/* ========== ONLINE HINTS (Pistas) - TURNOS SIMULTÁNEOS ========== */}
+                    {phase === 'online-hints' && onlineGameState && (
+                      <div className="screen screen-scroll fade-in">
+                        <div className="setup-container">
+                          <div className="setup-header">
+                            <div className="setup-title-area">
+                              <h1 className="setup-title">💬 {t('online.hints.title')}</h1>
                             </div>
                           </div>
-                        </>
-                      );
-                    })()}
-                  </div>
-                )}
 
-                {/* ========== ONLINE VOTE (Votación) ========== */}
-                {phase === 'online-vote' && onlineGameState && (
-                  <div className="screen fade-in">
-                    {(() => {
-                      const currentPlayerData = players.find(p => p.id === playerId);
-                      const isMyTurn = onlineGameState.currentTurn < players.length && players[onlineGameState.currentTurn]?.id === playerId;
-                      const currentTurnPlayer = players[onlineGameState.currentTurn];
+                          {(() => {
+                            const myPlayer = players.find(p => p.id === playerId);
+                            if (!myPlayer) return null;
 
-                      return (
-                        <>
-                          <h1 className="screen-title">
-                            {isMyTurn ? t('online.vote.yours') : t('online.vote.waiting', { player: currentTurnPlayer?.name || '...' })}
-                          </h1>
-                          <p className="screen-subtitle">
-                            {isMyTurn
-                              ? t('online.vote.instruction')
-                              : t('online.vote.waiting', { player: currentTurnPlayer?.name || '...' })
-                            }
-                          </p>
-
-                          {isMyTurn && !currentPlayerData?.votedFor && (
-                            <div className="vote-grid" style={{ marginTop: '24px' }}>
-                              {players.map(p => (
-                                <button
-                                  key={p.id}
-                                  className={`vote-option ${localSelectedVote === p.id ? 'selected' : ''} ${p.id === playerId ? 'disabled' : ''}`}
-                                  onClick={() => p.id !== playerId && setLocalSelectedVote(p.id)}
-                                  disabled={p.id === playerId}
-                                >
-                                  <span className="vote-option-icon">{p.icon}</span>
-                                  <span className="vote-option-name">{p.name}</span>
-                                </button>
-                              ))}
-                            </div>
-                          )}
-
-                          {isMyTurn && !currentPlayerData?.votedFor && (
-                            <button
-                              className="btn btn-primary btn-large mt-4"
-                              onClick={() => {
-                                if (localSelectedVote && wsRef.current) {
-                                  wsRef.current.send(JSON.stringify({
-                                    type: 'submit-vote',
-                                    votedFor: localSelectedVote
-                                  }));
-                                  setLocalSelectedVote(null);
-                                }
-                              }}
-                              disabled={!localSelectedVote}
-                            >
-                              {t('online.confirmVote')} →
-                            </button>
-                          )}
-
-                          {currentPlayerData?.votedFor && (
-                            <div style={{
-                              padding: '20px',
-                              background: 'var(--color-bg-card)',
-                              borderRadius: '16px',
-                              border: '2px solid var(--color-primary)',
-                              marginTop: '24px',
-                              textAlign: 'center'
-                            }}>
-                              <div style={{ fontSize: '16px', fontWeight: '600', marginBottom: '8px' }}>
-                                {t('online.votedAlready')}
-                              </div>
-                              <div style={{ fontSize: '14px', color: 'var(--color-text-soft)' }}>
-                                {t('online.votedFor', { player: players.find(p => p.id === currentPlayerData.votedFor)?.name || '?' })}
-                              </div>
-                            </div>
-                          )}
-
-                          <div style={{ marginTop: '24px', width: '100%', maxWidth: '500px' }}>
-                            <div style={{ fontSize: '14px', fontWeight: '600', marginBottom: '12px', color: 'var(--color-text-soft)' }}>
-                              {t('online.votes')}
-                            </div>
-                            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                              {players.map((p, idx) => (
-                                <div
-                                  key={p.id}
-                                  style={{
-                                    padding: '12px',
-                                    background: p.votedFor ? 'var(--color-bg-card)' : 'var(--color-bg-element)',
-                                    border: `2px solid ${p.votedFor ? 'var(--color-primary)' : 'var(--color-border)'}`,
-                                    borderRadius: '8px',
-                                    display: 'flex',
-                                    alignItems: 'center',
-                                    justifyContent: 'space-between'
-                                  }}
-                                >
-                                  <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-                                    <span style={{ fontSize: '24px' }}>{p.icon}</span>
-                                    <span style={{ fontSize: '14px', fontWeight: '600' }}>{p.name}</span>
-                                  </div>
-                                  {p.votedFor ? (
-                                    <span style={{ fontSize: '14px', color: 'var(--color-primary)' }}>
-                                      → {players.find(pl => pl.id === p.votedFor)?.name || '?'}
+                            return (
+                              <>
+                                {/* Mi información de rol */}
+                                <div className={`online-role-reminder ${myPlayer.role === 'impostor' ? 'impostor' : 'civil'}`}>
+                                  <div className="role-reminder-header">
+                                    <span className="role-reminder-icon">{myPlayer.icon}</span>
+                                    <span className="role-reminder-label">
+                                      {myPlayer.role === 'impostor' ? t('online.role.impostor') : t('online.role.civil')}
                                     </span>
-                                  ) : (
-                                    <span style={{ fontSize: '12px', color: 'var(--color-text-soft)' }}>{t('online.pending')}</span>
+                                  </div>
+                                  {myPlayer.role === 'civil' && onlineGameState.secretWord && (
+                                    <div className="role-reminder-word">
+                                      <span className="word-label">{t('online.reveal.secretWord')}</span>
+                                      <span className="word-value">{onlineGameState.secretWord}</span>
+                                    </div>
+                                  )}
+                                  {myPlayer.role === 'impostor' && myPlayer.impostorClue && (
+                                    <div className="role-reminder-clue">
+                                      <span className="clue-label">{t('online.reveal.clue')}</span>
+                                      <span className="clue-value">{myPlayer.impostorClue}</span>
+                                    </div>
                                   )}
                                 </div>
-                              ))}
-                            </div>
-                          </div>
-                        </>
-                      );
-                    })()}
-                  </div>
-                )}
 
-                {/* ========== ONLINE RESULTS (Resultados) ========== */}
-                {phase === 'online-results' && onlineGameState && (
-                  <div className="screen fade-in">
-                    <Confetti isActive={true} variant={onlineGameState.winner === 'civils' ? 'civils' : 'impostor'} />
-                    <VictoryWaves variant={onlineGameState.winner === 'civils' ? 'civils' : 'impostor'} />
-                    <div className={`reveal-card ${onlineGameState.winner === 'civils' ? 'civils-win' : 'impostor-wins'}`}>
-                      <h1 className="reveal-title">
-                        {onlineGameState.winner === 'civils' ? '🎉 ' + t('results.civilsWin') : '😈 ' + t('results.impostorWins')}
-                      </h1>
+                                {/* Input de pista */}
+                                {!myPlayer.hint ? (
+                                  <div className="hint-input-section">
+                                    <label className="hint-input-label">{t('online.hints.yourHint')}</label>
+                                    <div className="hint-input-row">
+                                      <input
+                                        type="text"
+                                        className="hint-input"
+                                        placeholder={t('online.placeholder')}
+                                        value={hintInput}
+                                        onChange={(e) => setHintInput(e.target.value)}
+                                        maxLength={50}
+                                        onKeyDown={(e) => {
+                                          if (e.key === 'Enter' && hintInput.trim() && wsRef.current?.readyState === WebSocket.OPEN) {
+                                            wsRef.current.send(JSON.stringify({ type: 'submit-hint', playerId, hint: hintInput.trim() }));
+                                            setHintInput('');
+                                          }
+                                        }}
+                                      />
+                                      <button
+                                        className="hint-submit-btn"
+                                        disabled={!hintInput.trim()}
+                                        onClick={() => {
+                                          if (hintInput.trim() && wsRef.current?.readyState === WebSocket.OPEN) {
+                                            wsRef.current.send(JSON.stringify({ type: 'submit-hint', playerId, hint: hintInput.trim() }));
+                                            setHintInput('');
+                                          }
+                                        }}
+                                      >
+                                        {t('online.hints.submit')} →
+                                      </button>
+                                    </div>
+                                  </div>
+                                ) : (
+                                  <div className="hint-sent-badge">
+                                    ✅ {t('online.hints.sent')}: "{myPlayer.hint}"
+                                  </div>
+                                )}
 
-                      <div className="reveal-section">
-                        <div className="reveal-label">{t('results.theImpostor')}</div>
-                        <div className="reveal-impostor">
-                          {players.filter(p => p.role === 'impostor').map(p => (
-                            <div key={p.id} className="reveal-impostor-item">
-                              <span className="reveal-impostor-icon">{p.icon}</span>
-                              <span className="reveal-impostor-name">{p.name}</span>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
+                                {/* Lista de jugadores y sus pistas */}
+                                <div className="hints-players-list">
+                                  <h3 className="hints-list-title">{t('online.hintsReceived')}</h3>
+                                  {players.map((p) => {
+                                    const isMe = p.id === playerId;
+                                    const hasSent = !!p.hint;
+                                    const isSuspectedByMe = p.suspectedBy?.includes(playerId || '');
 
-                      <div className="reveal-section">
-                        <div className="reveal-label">{t('results.theWord')}</div>
-                        <div className="reveal-word">{onlineGameState.secretWord}</div>
-                      </div>
-
-                      <div className="reveal-section" style={{ marginTop: '20px' }}>
-                        <div className="reveal-label">{t('online.allHints')}</div>
-                        <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginTop: '12px' }}>
-                          {players.map(p => (
-                            <div key={p.id} style={{
-                              padding: '10px',
-                              background: 'rgba(255,255,255,0.1)',
-                              borderRadius: '8px',
-                              display: 'flex',
-                              alignItems: 'center',
-                              gap: '12px'
-                            }}>
-                              <span>{p.icon}</span>
-                              <span style={{ fontWeight: '600' }}>{p.name}:</span>
-                              <span style={{ fontStyle: 'italic', color: 'var(--color-text-soft)' }}>"{p.hint || t('online.noHint')}"</span>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                    </div>
-
-                    <div className="flex gap-3 mt-4">
-                      <button className="btn btn-ghost" onClick={handleGoHome}>{t('results.backHome')}</button>
-                      <button
-                        className="btn btn-secondary"
-                        onClick={() => {
-                          if (wsRef.current) {
-                            wsRef.current.send(JSON.stringify({ type: 'play-again' }));
-                          }
-                        }}
-                      >
-                        {t('results.playAgain')} 🔄
-                      </button>
-                    </div>
-                  </div>
-                )}
-
-                {/* ========== RESULTS - Resumen de partida (LOCAL) ========== */}
-                {phase === 'results' && localGame && (
-                  <div className="screen fade-in">
-                    <Confetti isActive={true} variant="civils" />
-
-                    <div className="setup-header">
-                      <div className="setup-title-area">
-                        <h1 className="setup-title">{t('results.summary')}</h1>
-                      </div>
-                    </div>
-
-                    <div className="reveal-card summary-card" style={{ marginTop: 0 }}>
-
-                      {/* Resumen de jugadores */}
-                      <div className="summary-section">
-                        <div className="summary-grid">
-                          {/* Civiles */}
-                          <div className="summary-group civils">
-                            <div className="summary-group-title">{t('results.civils')}</div>
-                            <div className="summary-players">
-                              {players.filter(p => p.role === 'civil').map(p => (
-                                <div key={p.id} className="summary-player">
-                                  <span className="summary-player-icon">{p.icon}</span>
-                                  <span className="summary-player-name">{p.name}</span>
+                                    return (
+                                      <div key={p.id} className={`hint-player-row ${hasSent ? 'sent' : 'pending'} ${isMe ? 'is-me' : ''}`}>
+                                        <div className="hint-player-left">
+                                          <span className="hint-player-icon">{p.icon}</span>
+                                          <div className="hint-player-info">
+                                            <span className="hint-player-name">{p.name} {isMe && t('online.lobby.you')}</span>
+                                            <span className={`hint-status ${hasSent ? 'sent' : 'pending'}`}>
+                                              {hasSent ? `"${p.hint}"` : t('online.hints.playerPending')}
+                                            </span>
+                                          </div>
+                                        </div>
+                                        {!isMe && (
+                                          <button
+                                            className={`suspect-btn ${isSuspectedByMe ? 'suspected' : ''}`}
+                                            onClick={() => {
+                                              if (wsRef.current?.readyState === WebSocket.OPEN) {
+                                                wsRef.current.send(JSON.stringify({ type: 'suspect-player', playerId, suspectId: p.id }));
+                                              }
+                                            }}
+                                            title={t('online.suspect')}
+                                          >
+                                            {isSuspectedByMe ? '🔴' : '⚪'}
+                                            {p.suspectedBy && p.suspectedBy.length > 0 && (
+                                              <span className="suspect-count">{p.suspectedBy.length}</span>
+                                            )}
+                                          </button>
+                                        )}
+                                      </div>
+                                    );
+                                  })}
                                 </div>
-                              ))}
-                            </div>
-                          </div>
 
-                          {/* Impostores */}
-                          <div className="summary-group impostors">
-                            <div className="summary-group-title">{t('results.theImpostor')}</div>
-                            <div className="summary-players">
+                                {/* Estado de espera */}
+                                {myPlayer.hint && !players.every(p => p.hint) && (
+                                  <div className="waiting-hints-status">
+                                    <div className="waiting-spinner"></div>
+                                    <span>{t('online.hints.waitingOthers')}</span>
+                                    <span className="waiting-count">{players.filter(p => p.hint).length}/{players.length}</span>
+                                  </div>
+                                )}
+                              </>
+                            );
+                          })()}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* ========== ONLINE VOTE (Votación simultánea) ========== */}
+                    {phase === 'online-vote' && onlineGameState && (
+                      <div className="screen fade-in">
+                        {(() => {
+                          const currentPlayerData = players.find(p => p.id === playerId);
+                          const hasVoted = !!currentPlayerData?.votedFor;
+                          const votedCount = players.filter(p => p.votedFor).length;
+                          const totalPlayers = players.length;
+
+                          return (
+                            <>
+                              <h1 className="screen-title">🗳️ {t('online.vote.title')}</h1>
+                              <p className="screen-subtitle">{t('online.vote.instruction')}</p>
+
+                              {/* Progreso de votos */}
+                              <div className="vote-progress">
+                                <div className="vote-progress-bar">
+                                  <div
+                                    className="vote-progress-fill"
+                                    style={{ width: `${(votedCount / totalPlayers) * 100}%` }}
+                                  />
+                                </div>
+                                <span className="vote-progress-text">{votedCount}/{totalPlayers} {t('online.vote.voted')}</span>
+                              </div>
+
+                              {/* Grid de votación - solo si no ha votado */}
+                              {!hasVoted ? (
+                                <>
+                                  <div className="vote-grid">
+                                    {players.map(p => (
+                                      <button
+                                        key={p.id}
+                                        className={`vote-card ${localSelectedVote === p.id ? 'selected' : ''} ${p.id === playerId ? 'is-me' : ''}`}
+                                        onClick={() => p.id !== playerId && setLocalSelectedVote(p.id)}
+                                        disabled={p.id === playerId}
+                                      >
+                                        <span className="vote-card-icon">{p.icon}</span>
+                                        <span className="vote-card-name">{p.name}</span>
+                                        {p.id === playerId && <span className="vote-card-me">({t('online.you')})</span>}
+                                        {p.suspectedBy && p.suspectedBy.length > 0 && (
+                                          <span className="vote-card-suspects">
+                                            ⚠️ {p.suspectedBy.length}
+                                          </span>
+                                        )}
+                                      </button>
+                                    ))}
+                                  </div>
+
+                                  <button
+                                    className="btn btn-primary btn-large"
+                                    onClick={() => {
+                                      if (localSelectedVote && wsRef.current) {
+                                        wsRef.current.send(JSON.stringify({
+                                          type: 'submit-vote',
+                                          playerId,
+                                          votedFor: localSelectedVote
+                                        }));
+                                        setLocalSelectedVote(null);
+                                      }
+                                    }}
+                                    disabled={!localSelectedVote}
+                                    style={{ marginTop: '24px' }}
+                                  >
+                                    {t('online.confirmVote')} →
+                                  </button>
+                                </>
+                              ) : (
+                                /* Ya votó - mostrar estado de espera */
+                                <div className="vote-waiting">
+                                  <div className="vote-waiting-icon">✓</div>
+                                  <div className="vote-waiting-text">{t('online.votedAlready')}</div>
+                                  <div className="vote-waiting-for">
+                                    {t('online.votedFor', { player: players.find(p => p.id === currentPlayerData.votedFor)?.name || '?' })}
+                                  </div>
+                                  <div className="vote-waiting-hint">{t('online.vote.waitingOthers')}</div>
+                                </div>
+                              )}
+
+                              {/* Lista de estado de votos */}
+                              <div className="vote-status-list">
+                                <div className="vote-status-title">{t('online.votes')}</div>
+                                <div className="vote-status-grid">
+                                  {players.map(p => (
+                                    <div
+                                      key={p.id}
+                                      className={`vote-status-item ${p.votedFor ? 'voted' : 'pending'}`}
+                                    >
+                                      <span className="vote-status-icon">{p.icon}</span>
+                                      <span className="vote-status-name">{p.name}</span>
+                                      <span className="vote-status-badge">
+                                        {p.votedFor ? '✓' : '⏳'}
+                                      </span>
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+                            </>
+                          );
+                        })()}
+                      </div>
+                    )}
+
+                    {/* ========== ONLINE RESULTS (Resultados) ========== */}
+                    {phase === 'online-results' && onlineGameState && (
+                      <div className="screen fade-in">
+                        <Confetti isActive={true} variant={onlineGameState.winner === 'civils' ? 'civils' : 'impostor'} />
+                        <VictoryWaves variant={onlineGameState.winner === 'civils' ? 'civils' : 'impostor'} />
+                        <div className={`reveal-card ${onlineGameState.winner === 'civils' ? 'civils-win' : 'impostor-wins'}`}>
+                          <h1 className="reveal-title">
+                            {onlineGameState.winner === 'civils' ? '🎉 ' + t('results.civilsWin') : '😈 ' + t('results.impostorWins')}
+                          </h1>
+
+                          <div className="reveal-section">
+                            <div className="reveal-label">{t('results.theImpostor')}</div>
+                            <div className="reveal-impostor">
                               {players.filter(p => p.role === 'impostor').map(p => (
-                                <div key={p.id} className="summary-player impostor">
-                                  <span className="summary-player-icon">{p.icon}</span>
-                                  <span className="summary-player-name">{p.name}</span>
+                                <div key={p.id} className="reveal-impostor-item">
+                                  <span className="reveal-impostor-icon">{p.icon}</span>
+                                  <span className="reveal-impostor-name">{p.name}</span>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+
+                          <div className="reveal-section">
+                            <div className="reveal-label">{t('results.theWord')}</div>
+                            <div className="reveal-word">{onlineGameState.secretWord}</div>
+                          </div>
+
+                          <div className="reveal-section" style={{ marginTop: '20px' }}>
+                            <div className="reveal-label">{t('online.allHints')}</div>
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginTop: '12px' }}>
+                              {players.map(p => (
+                                <div key={p.id} style={{
+                                  padding: '10px',
+                                  background: 'rgba(255,255,255,0.1)',
+                                  borderRadius: '8px',
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  gap: '12px'
+                                }}>
+                                  <span>{p.icon}</span>
+                                  <span style={{ fontWeight: '600' }}>{p.name}:</span>
+                                  <span style={{ fontStyle: 'italic', color: 'var(--color-text-soft)' }}>"{p.hint || t('online.noHint')}"</span>
                                 </div>
                               ))}
                             </div>
                           </div>
                         </div>
-                      </div>
 
-                      {/* Palabra secreta */}
-                      <div className="summary-section word-section">
-                        <div className="summary-label">{t('results.theWord')}</div>
-                        <div className="summary-word">{localGame.secretWord}</div>
-                      </div>
-
-                      {/* Pista si estaba habilitada */}
-                      {config.impostorClueEnabled && localGame.impostorClue && (
-                        <div className="summary-section clue-section">
-                          <div className="summary-label">{t('results.theClue')}</div>
-                          <div className="summary-clue">{localGame.impostorClue}</div>
+                        <div className="flex gap-3 mt-4">
+                          <button className="btn btn-ghost" onClick={handleGoHome}>{t('results.backHome')}</button>
+                          <button
+                            className="btn btn-secondary"
+                            onClick={() => {
+                              if (wsRef.current) {
+                                wsRef.current.send(JSON.stringify({ type: 'play-again', playerId }));
+                              }
+                            }}
+                          >
+                            {t('results.playAgain')} 🔄
+                          </button>
                         </div>
-                      )}
-                    </div>
+                      </div>
+                    )}
 
-                    <div className="flex gap-3 mt-4">
-                      <button className="btn btn-ghost" onClick={handleGoHome}>{t('results.backHome')}</button>
-                      <button className="btn btn-primary" onClick={handlePlayAgain}>{t('results.playAgain')}</button>
-                    </div>
-                  </div>
-                )}
-                </>
+                    {/* ========== RESULTS - Resumen de partida (LOCAL) ========== */}
+                    {phase === 'results' && localGame && (
+                      <div className="screen screen-scroll fade-in">
+                        <Confetti isActive={true} variant="civils" />
+
+                        <div className="setup-header">
+                          <div className="setup-title-area">
+                            <h1 className="setup-title">{t('results.summary')}</h1>
+                          </div>
+                        </div>
+
+                        <div className="reveal-card summary-card" style={{ marginTop: 0 }}>
+
+                          {/* Resumen de jugadores */}
+                          <div className="summary-section">
+                            <div className="summary-grid">
+                              {/* Civiles */}
+                              <div className="summary-group civils">
+                                <div className="summary-group-title">{t('results.civils')}</div>
+                                <div className="summary-players">
+                                  {players.filter(p => p.role === 'civil').map(p => (
+                                    <div key={p.id} className="summary-player">
+                                      <span className="summary-player-icon">{p.icon}</span>
+                                      <span className="summary-player-name">{p.name}</span>
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+
+                              {/* Impostores */}
+                              <div className="summary-group impostors">
+                                <div className="summary-group-title">{t('results.theImpostor')}</div>
+                                <div className="summary-players">
+                                  {players.filter(p => p.role === 'impostor').map(p => (
+                                    <div key={p.id} className="summary-player impostor">
+                                      <span className="summary-player-icon">{p.icon}</span>
+                                      <span className="summary-player-name">{p.name}</span>
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+                            </div>
+                          </div>
+
+                          {/* Palabra secreta y Pista - lado a lado en desktop */}
+                          <div className="summary-section summary-words-row">
+                            <div className="word-section">
+                              <div className="summary-label">{t('results.theWord')}</div>
+                              <div className="summary-word">{localGame.secretWord}</div>
+                            </div>
+
+                            {/* Pista si estaba habilitada */}
+                            {config.impostorClueEnabled && localGame.impostorClue && (
+                              <div className="clue-section">
+                                <div className="summary-label">{t('results.theClue')}</div>
+                                <div className="summary-clue">{localGame.impostorClue}</div>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+
+                        <div className="flex gap-3 mt-4">
+                          <button className="btn btn-ghost" onClick={handleGoHome}>{t('results.backHome')}</button>
+                          <button className="btn btn-primary" onClick={handlePlayAgain}>{t('results.playAgain')}</button>
+                        </div>
+                      </div>
+                    )}
+                  </>
                 )}
 
               </div>

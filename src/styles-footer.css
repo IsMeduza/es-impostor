@@ -264,11 +264,14 @@
 @media (max-width: 600px) {
   .legal-page-overlay {
     /* Más separación respecto a los bordes en móviles */
-    padding: 18px;
+    padding: 24px 16px;
+    padding-top: calc(24px + env(safe-area-inset-top, 0px));
+    padding-bottom: calc(24px + env(safe-area-inset-bottom, 0px));
   }
 
   .legal-page-content {
-    max-height: 95vh;
+    max-height: 85vh;
+    border-width: 1px;
   }
 
   .legal-page-header {

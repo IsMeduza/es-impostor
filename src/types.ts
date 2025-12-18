@@ -50,9 +50,12 @@ export interface Player {
   hint?: string;
   impostorClue?: string; // Pista recibida por el impostor
   votedFor?: string; // ID del jugador votado
+  isReady?: boolean; // Para online lobby
+  hasSeenRole?: boolean; // Para online reveal
+  suspectedBy?: string[]; // IDs de jugadores que sospechan
 }
 
-export type GamePhase = 'home' | 'setup' | 'setup-players' | 'online-setup' | 'online-lobby' | 'lobby' | 'turn-reveal' | 'discussion' | 'vote' | 'results' | 'online-hints' | 'online-vote' | 'online-results';
+export type GamePhase = 'home' | 'setup' | 'setup-players' | 'online-setup' | 'online-lobby' | 'lobby' | 'turn-reveal' | 'discussion' | 'vote' | 'results' | 'online-reveal' | 'online-hints' | 'online-vote' | 'online-results';
 
 export interface GameConfig {
   mode: GameMode;
