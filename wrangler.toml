@@ -1,0 +1,13 @@
+# Cloudflare Pages Configuration
+# Este archivo permite que "wrangler pages deploy" despliegue el frontend
+# El Worker se despliega por separado desde worker/wrangler.toml
+
+name = "es-impostor-pages"
+compatibility_date = "2024-01-01"
+pages_build_output_dir = "dist"
+
+[env.production]
+name = "es-impostor-pages"
+
+[env.preview]
+name = "es-impostor-pages-preview"

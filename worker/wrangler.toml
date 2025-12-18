@@ -1,0 +1,21 @@
+# ES IMPOSTOR - Cloudflare Worker Configuration
+name = "es-impostor-api"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+
+# Durable Objects para salas en tiempo real
+[durable_objects]
+bindings = [
+  { name = "ROOMS", class_name = "RoomsDurableObject" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RoomsDurableObject"]
+
+# Variables de entorno (configura en dashboard o con wrangler secret)
+# GEMINI_API_KEY = "tu-api-key-aqui"
+
+[vars]
+# Para desarrollo local, puedes poner aquí valores de prueba
+# En producción, usa `wrangler secret put GEMINI_API_KEY`

@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="es">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>És Impostor</title>
+  <meta name="description"
+    content="Juego social de deducción en tiempo real. Descubre quién es el impostor sin revelar la palabra secreta. Juega con amigos en el mismo dispositivo." />
+  <meta name="theme-color" content="#0a0a1a" />
+
+  <!-- Security Headers -->
+
+
+  <meta http-equiv="Referrer-Policy" content="strict-origin-when-cross-origin" />
+  <meta http-equiv="Permissions-Policy" content="geolocation=(), microphone=(), camera=()" />
+
+  <!-- Fuente Inter -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link
+    href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap"
+    rel="stylesheet">
+
+  <!-- Google Consent Mode v2 - Configuración inicial -->
+  <script>
+    window.dataLayer = window.dataLayer || [];
+    function gtag() { dataLayer.push(arguments); }
+    // Configurar consentimiento por defecto como "denied" (requerido para EEA/UK/CH)
+    gtag('consent', 'default', {
+      'ad_storage': 'denied',
+      'ad_user_data': 'denied',
+      'ad_personalization': 'denied',
+      'analytics_storage': 'denied',
+      'wait_for_update': 500,
+    });
+    gtag('set', 'ads_data_redaction', true);
+  </script>
+
+  <!-- Google AdSense con bloqueo hasta consentimiento -->
+  <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7845247617561167"
+    crossorigin="anonymous" data-block-on-consent></script>
+  <meta name="google-adsense-account" content="ca-pub-7845247617561167" />
+
+  <!-- PWA / Favicon -->
+  <link rel="icon"
+    href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎭</text></svg>">
+
+  <style>
+    /* Critical CSS para evitar flash */
+    html,
+    body {
+      margin: 0;
+      padding: 0;
+      background: #0a0a1a;
+      color: #f8fafc;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="root"></div>
+  <script type="module" src="/src/main.tsx"></script>
+</body>
+
+</html>
